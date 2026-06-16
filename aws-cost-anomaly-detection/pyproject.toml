@@ -1,0 +1,31 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--tb=short",
+    "--strict-markers",
+]
+log_cli = true
+log_cli_level = "WARNING"
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["tests/*", "*/site-packages/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+fail_under = 80
+
+[tool.black]
+line-length = 110
+target-version = ["py311"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
