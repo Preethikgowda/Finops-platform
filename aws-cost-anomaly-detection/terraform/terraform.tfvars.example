@@ -1,0 +1,36 @@
+# Copy this file to terraform.tfvars and fill in all values.
+# Do NOT commit terraform.tfvars to version control.
+
+aws_region  = "us-east-1"
+environment = "prod"
+project_name = "cost-anomaly-detector"
+
+# Lambda
+lambda_timeout_seconds = 60
+lambda_memory_mb       = 512
+log_retention_days     = 7
+log_level              = "INFO"
+
+# Schedule — run at 08:00 UTC every day
+schedule_hour = 8
+
+# Elasticsearch
+es_host                = "my-es-cluster.example.com"
+es_port                = 9200
+es_scheme              = "https"
+es_index_prefix        = "aws-costs"
+es_deploy_index_prefix = "deployment-logs"
+es_infra_index_prefix  = "infra-events"
+es_verify_certs        = true
+es_historical_days     = 30
+
+# Slack — use a Slack App incoming webhook
+slack_webhook_url  = "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
+cost_dashboard_url = "https://console.aws.amazon.com/cost-management/home"
+
+# Bedrock
+bedrock_model_id = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+
+# Cost analysis
+cost_threshold_pct  = 15.0
+rolling_window_days = 7
