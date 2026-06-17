@@ -1,12 +1,9 @@
-# Core AWS SDK
-boto3==1.34.144
-botocore==1.34.144
+# Core AWS SDK — all AWS service calls (Bedrock, Cost Explorer, CloudTrail,
+# Athena, DynamoDB, Compute Optimizer) are made through boto3.
+boto3>=1.28.0
+botocore>=1.31.0
 
-# Elasticsearch client
-elasticsearch==8.14.0
-elastic-transport==8.13.1
-
-# HTTP
+# HTTP — Slack webhook delivery
 requests==2.32.3
 urllib3==2.2.2
 certifi==2024.7.4

@@ -1,8 +1,8 @@
 """Bedrock Agent Integration for FinOps Cost Analysis.
 
-Invokes Amazon Bedrock Claude Sonnet 3.5 via the Converse API to analyze
-cost anomalies and deployment events, returning structured root-cause analysis
-and recommendations.
+Invokes Amazon Nova Pro via the Converse API to analyze cost anomalies,
+CloudTrail resource changes, and Compute Optimizer recommendations, returning
+structured root-cause analysis and actionable cost reduction recommendations.
 """
 
 import json
@@ -16,23 +16,19 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 logger = logging.getLogger(__name__)
 
-# Default Bedrock model identifier (Claude Sonnet 3.5 v2)
-DEFAULT_MODEL_ID = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+# Amazon Nova Pro model identifier
+DEFAULT_MODEL_ID = "amazon.nova-pro-v1:0"
 
-SYSTEM_PROMPT = """You are an expert FinOps (Financial Operations) analyst specializing in AWS cloud cost
-optimization and anomaly investigation. Your role is to:
+SYSTEM_PROMPT = """You are a FinOps expert analyzing AWS cost anomalies.
 
-1. Analyze AWS cost anomalies and identify the most probable root causes.
-2. Correlate cost spikes with deployment events, infrastructure changes, and usage patterns.
-3. Provide actionable, prioritized recommendations to reduce costs.
-4. Communicate clearly with both technical and non-technical stakeholders.
+Your task:
+1. Analyze the cost spike data
+2. Review CloudTrail events to understand what changed
+3. Consider Compute Optimizer recommendations
+4. Provide root cause analysis
+5. Give actionable cost reduction recommendations
 
-When analyzing cost data:
-- Consider compute, storage, data transfer, and managed service costs separately.
-- Look for correlations between deployment events and cost increases.
-- Distinguish between one-time charges vs recurring cost increases.
-- Estimate the financial impact of each identified root cause.
-- Recommend specific AWS services, features, or architectural changes where relevant.
+Be precise, data-driven, and focus on financial impact.
 
 Always respond in valid JSON matching the schema:
 {
@@ -51,7 +47,7 @@ class BedRockException(Exception):
 
 @dataclass
 class BedrockAnalysisResult:
-    """Structured response from Bedrock cost analysis."""
+    """Structured response from Bedrock Nova Pro cost analysis."""
 
     anomaly_severity: str
     probable_root_causes: list[str]
@@ -68,7 +64,7 @@ def _build_bedrock_client(region: str) -> Any:
     """Create a boto3 Bedrock Runtime client.
 
     Args:
-        region: AWS region where Bedrock is available.
+        region: AWS region where Bedrock is available (ap-south-1 for Nova Pro).
 
     Returns:
         boto3 Bedrock Runtime client.
@@ -78,14 +74,16 @@ def _build_bedrock_client(region: str) -> Any:
 
 def _build_analysis_prompt(
     cost_data: dict[str, Any],
-    deployment_logs: list[dict[str, Any]],
+    cloudtrail_summary: Optional[str] = None,
+    compute_optimizer_summary: Optional[str] = None,
 ) -> str:
-    """Construct the user-facing analysis prompt from cost data and logs.
+    """Construct the user-facing analysis prompt from cost data and context.
 
     Args:
         cost_data: Dictionary containing cost metrics (yesterday_cost,
                    baseline_cost, cost_delta, percentage_increase, etc.).
-        deployment_logs: List of recent deployment events from Elasticsearch.
+        cloudtrail_summary: Pre-formatted CloudTrail resource changes section.
+        compute_optimizer_summary: Pre-formatted Compute Optimizer recommendations.
 
     Returns:
         Formatted prompt string.
@@ -100,24 +98,20 @@ def _build_analysis_prompt(
         f"- **Percentage Increase**: {cost_data.get('percentage_increase', 0):.1f}%",
         f"- **Analysis Date**: {cost_data.get('analysis_date', 'N/A')}",
         "",
-        "### Recent Deployment Events (Last 24 Hours)",
     ]
 
-    if deployment_logs:
-        for event in deployment_logs[:20]:  # Cap at 20 events to control token usage
-            timestamp = event.get("timestamp", "unknown")
-            event_type = event.get("event_type", "unknown")
-            description = event.get("description", "no description")
-            service = event.get("service", "unknown service")
-            prompt_lines.append(f"- [{timestamp}] {event_type} | {service}: {description}")
-    else:
-        prompt_lines.append("- No deployment events recorded in the last 24 hours.")
+    if cloudtrail_summary:
+        prompt_lines.append(cloudtrail_summary)
+        prompt_lines.append("")
+
+    if compute_optimizer_summary:
+        prompt_lines.append(compute_optimizer_summary)
+        prompt_lines.append("")
 
     prompt_lines += [
-        "",
         "### Analysis Request",
-        "Please analyze this cost anomaly, identify probable root causes considering the deployment",
-        "events above, and provide specific actionable recommendations.",
+        "Analyze this cost anomaly using the CloudTrail events and Compute Optimizer data above.",
+        "Identify the probable root causes and provide specific actionable cost reduction recommendations.",
         "Respond with valid JSON only — no prose outside the JSON object.",
     ]
 
@@ -125,7 +119,7 @@ def _build_analysis_prompt(
 
 
 def _parse_bedrock_response(content_text: str) -> dict[str, Any]:
-    """Parse and validate the JSON response from Claude.
+    """Parse and validate the JSON response from Nova Pro.
 
     Args:
         content_text: Raw text content returned by Bedrock.
@@ -138,11 +132,9 @@ def _parse_bedrock_response(content_text: str) -> dict[str, Any]:
         BedRockException: When the response cannot be parsed or is missing
                           required fields.
     """
-    # Strip any markdown code fences Claude occasionally adds
     text = content_text.strip()
     if text.startswith("```"):
         lines = text.splitlines()
-        # Drop opening and closing fence lines
         text = "\n".join(
             line for line in lines if not line.strip().startswith("```")
         )
@@ -209,15 +201,15 @@ def _fallback_response(
             "Possible causes: new deployments, scaling events, data transfer spikes.",
         ],
         explanation=(
-            f"Bedrock analysis could not be completed ({reason}). "
+            f"Nova Pro analysis could not be completed ({reason}). "
             f"A cost increase of {pct:.1f}% was detected. "
-            "Please review the Cost Explorer console and recent deployment events manually."
+            "Please review the Cost Explorer console and recent CloudTrail events manually."
         ),
         recommendations=[
             "Review AWS Cost Explorer for service-level breakdown.",
-            "Check recent deployment events and auto-scaling activity.",
+            "Check CloudTrail for recent EC2, RDS, and Auto Scaling changes.",
+            "Run AWS Compute Optimizer for rightsizing recommendations.",
             "Compare resource counts today vs the 7-day baseline.",
-            "Investigate data transfer and storage costs.",
         ],
         is_fallback=True,
     )
@@ -225,33 +217,43 @@ def _fallback_response(
 
 def invoke_bedrock_analysis(
     cost_data: dict[str, Any],
-    deployment_logs: list[dict[str, Any]],
+    cloudtrail_summary: Optional[str] = None,
+    compute_optimizer_summary: Optional[str] = None,
     model_id: str = DEFAULT_MODEL_ID,
-    region: str = "us-east-1",
+    region: str = "ap-south-1",
     max_tokens: int = 1024,
+    temperature: float = 0.7,
     max_attempts: int = 3,
     base_delay: float = 2.0,
+    # Legacy parameter kept for backward compatibility
+    deployment_logs: Optional[list[dict[str, Any]]] = None,
 ) -> BedrockAnalysisResult:
-    """Invoke Bedrock Claude to analyze a cost anomaly.
+    """Invoke Bedrock Amazon Nova Pro to analyze a cost anomaly.
 
-    Calls Claude via the Converse API with structured cost and deployment data.
-    Implements exponential-backoff retry on transient errors and returns a
-    safe fallback response on unrecoverable failures.
+    Calls Nova Pro via the Converse API with structured cost data, CloudTrail
+    events, and Compute Optimizer recommendations. Implements exponential-backoff
+    retry on transient errors and returns a safe fallback on unrecoverable failures.
 
     Args:
-        cost_data: Cost metrics dictionary (output of CostAnalysisResult or
-                   equivalent dict with yesterday_cost, baseline_cost, etc.).
-        deployment_logs: Recent deployment/infrastructure events from Elasticsearch.
-        model_id: Bedrock model identifier.
-        region: AWS region for the Bedrock Runtime client.
-        max_tokens: Maximum number of tokens in Claude's response.
+        cost_data: Cost metrics dictionary (yesterday_cost, baseline_cost, etc.).
+        cloudtrail_summary: Pre-formatted CloudTrail resource changes string.
+        compute_optimizer_summary: Pre-formatted Compute Optimizer recommendations string.
+        model_id: Bedrock model identifier (default: amazon.nova-pro-v1:0).
+        region: AWS region for the Bedrock Runtime client (default: ap-south-1).
+        max_tokens: Maximum number of tokens in Nova Pro's response.
+        temperature: Sampling temperature (0.7 balances precision and creativity).
         max_attempts: Maximum retry attempts on transient failures.
         base_delay: Initial backoff delay in seconds.
+        deployment_logs: Deprecated — ignored. Kept for backward compatibility.
 
     Returns:
         :class:`BedrockAnalysisResult` with analysis or fallback data.
     """
-    prompt = _build_analysis_prompt(cost_data, deployment_logs)
+    prompt = _build_analysis_prompt(
+        cost_data=cost_data,
+        cloudtrail_summary=cloudtrail_summary,
+        compute_optimizer_summary=compute_optimizer_summary,
+    )
 
     client = _build_bedrock_client(region)
 
@@ -263,14 +265,14 @@ def invoke_bedrock_analysis(
     ]
 
     system = [{"text": SYSTEM_PROMPT}]
-    inference_config = {"maxTokens": max_tokens, "temperature": 0.1}
+    inference_config = {"maxTokens": max_tokens, "temperature": temperature}
 
     last_exc: Optional[Exception] = None
     for attempt in range(1, max_attempts + 1):
         try:
             logger.info(
-                "Invoking Bedrock model",
-                extra={"model_id": model_id, "attempt": attempt},
+                "Invoking Bedrock Nova Pro",
+                extra={"model_id": model_id, "attempt": attempt, "region": region},
             )
             response = client.converse(
                 modelId=model_id,
@@ -284,7 +286,7 @@ def invoke_bedrock_analysis(
             output_tokens = usage.get("outputTokens", 0)
 
             logger.info(
-                "Bedrock invocation successful",
+                "Bedrock Nova Pro invocation successful",
                 extra={
                     "model_id": model_id,
                     "input_tokens": input_tokens,
@@ -292,7 +294,6 @@ def invoke_bedrock_analysis(
                 },
             )
 
-            # Extract text from the response
             content_blocks = (
                 response.get("output", {})
                 .get("message", {})
@@ -320,22 +321,22 @@ def invoke_bedrock_analysis(
             last_exc = exc
             error_code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
 
-            # Non-retryable errors: access denied, model not available, etc.
             non_retryable = {
                 "AccessDeniedException",
                 "ValidationException",
                 "ResourceNotFoundException",
+                "ModelNotReadyException",
             }
             if error_code in non_retryable or attempt == max_attempts:
                 logger.error(
-                    "Bedrock API error (non-retryable or max attempts reached)",
+                    "Bedrock Nova Pro API error (non-retryable or max attempts reached)",
                     extra={"error_code": error_code, "attempt": attempt, "error": str(exc)},
                 )
                 break
 
             delay = base_delay * (2 ** (attempt - 1))
             logger.warning(
-                "Bedrock API transient error, retrying in %.1fs (attempt %d/%d): %s",
+                "Bedrock Nova Pro transient error, retrying in %.1fs (attempt %d/%d): %s",
                 delay,
                 attempt,
                 max_attempts,
@@ -344,7 +345,7 @@ def invoke_bedrock_analysis(
             time.sleep(delay)
 
         except BedRockException as exc:
-            logger.error("Failed to parse Bedrock response: %s", exc)
+            logger.error("Failed to parse Nova Pro response: %s", exc)
             last_exc = exc
             break
 

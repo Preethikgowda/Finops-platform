@@ -1,11 +1,11 @@
 variable "aws_region" {
-  description = "AWS region for all resources."
+  description = "AWS region for all resources. Default is ap-south-1 (Asia Pacific - Mumbai)."
   type        = string
-  default     = "us-east-1"
+  default     = "ap-south-1"
 
   validation {
     condition     = can(regex("^[a-z]{2}-[a-z]+-[0-9]+$", var.aws_region))
-    error_message = "aws_region must be a valid AWS region (e.g. us-east-1, eu-west-2)."
+    error_message = "aws_region must be a valid AWS region (e.g. ap-south-1, us-east-1)."
   }
 }
 
@@ -38,7 +38,7 @@ variable "project_name" {
 variable "lambda_timeout_seconds" {
   description = "Lambda function timeout in seconds."
   type        = number
-  default     = 60
+  default     = 120
 
   validation {
     condition     = var.lambda_timeout_seconds >= 10 && var.lambda_timeout_seconds <= 900
@@ -95,59 +95,47 @@ variable "schedule_hour" {
 }
 
 # ---------------------------------------------------------------------------
-# Elasticsearch
+# CloudTrail + Athena
 # ---------------------------------------------------------------------------
 
-variable "es_host" {
-  description = "Elasticsearch cluster hostname or Elastic Cloud endpoint."
+variable "cloudtrail_s3_bucket" {
+  description = "S3 bucket where CloudTrail logs are stored."
   type        = string
+  default     = ""
 }
 
-variable "es_port" {
-  description = "Elasticsearch port number."
-  type        = number
-  default     = 9200
-}
-
-variable "es_scheme" {
-  description = "Elasticsearch connection scheme (https or http)."
+variable "cloudtrail_s3_prefix" {
+  description = "S3 key prefix for CloudTrail logs (e.g. AWSLogs/)."
   type        = string
-  default     = "https"
-
-  validation {
-    condition     = contains(["http", "https"], var.es_scheme)
-    error_message = "es_scheme must be 'http' or 'https'."
-  }
+  default     = "AWSLogs/"
 }
 
-variable "es_index_prefix" {
-  description = "Elasticsearch index prefix for cost data."
+variable "athena_results_bucket" {
+  description = "S3 bucket for Athena query results (must already exist)."
   type        = string
-  default     = "aws-costs"
+  default     = ""
 }
 
-variable "es_deploy_index_prefix" {
-  description = "Elasticsearch index prefix for deployment event logs."
+variable "athena_database" {
+  description = "Athena database name for CloudTrail log queries."
   type        = string
-  default     = "deployment-logs"
+  default     = "cloudtrail_logs"
 }
 
-variable "es_infra_index_prefix" {
-  description = "Elasticsearch index prefix for infrastructure change events."
+variable "athena_table" {
+  description = "Athena table name for CloudTrail logs."
   type        = string
-  default     = "infra-events"
+  default     = "cloudtrail"
 }
 
-variable "es_verify_certs" {
-  description = "Whether to verify TLS certificates for Elasticsearch connections."
-  type        = bool
-  default     = true
-}
+# ---------------------------------------------------------------------------
+# DynamoDB
+# ---------------------------------------------------------------------------
 
-variable "es_historical_days" {
-  description = "Number of days of historical cost data to query from Elasticsearch."
-  type        = number
-  default     = 30
+variable "dynamodb_table_name" {
+  description = "Name of the DynamoDB table for cost baselines, idempotency, and cache."
+  type        = string
+  default     = "finops-cost-baselines"
 }
 
 # ---------------------------------------------------------------------------
@@ -172,13 +160,13 @@ variable "cost_dashboard_url" {
 }
 
 # ---------------------------------------------------------------------------
-# Bedrock
+# Bedrock — Amazon Nova Pro
 # ---------------------------------------------------------------------------
 
 variable "bedrock_model_id" {
-  description = "Amazon Bedrock model ID to use for cost analysis."
+  description = "Amazon Bedrock model ID. Defaults to Amazon Nova Pro."
   type        = string
-  default     = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+  default     = "amazon.nova-pro-v1:0"
 }
 
 # ---------------------------------------------------------------------------

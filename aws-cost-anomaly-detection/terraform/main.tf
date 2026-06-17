@@ -16,7 +16,7 @@ terraform {
   # backend "s3" {
   #   bucket         = "your-terraform-state-bucket"
   #   key            = "cost-anomaly-detection/terraform.tfstate"
-  #   region         = "us-east-1"
+  #   region         = "ap-south-1"
   #   encrypt        = true
   #   dynamodb_table = "terraform-lock"
   # }
@@ -110,14 +110,14 @@ resource "aws_iam_role_policy" "cost_explorer" {
 }
 
 resource "aws_iam_role_policy" "bedrock_invoke" {
-  name = "bedrock-model-invoke"
+  name = "bedrock-nova-pro-invoke"
   role = aws_iam_role.lambda_exec.id
 
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "BedrockModelInvoke"
+        Sid    = "BedrockNovaProInvoke"
         Effect = "Allow"
         Action = [
           "bedrock:InvokeModel",
@@ -183,21 +183,116 @@ resource "aws_iam_role_policy" "xray" {
 }
 
 resource "aws_iam_role_policy" "dynamodb" {
-  name = "dynamodb-idempotency"
+  name = "dynamodb-finops-state"
   role = aws_iam_role.lambda_exec.id
 
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "DynamoDBIdempotency"
+        Sid    = "DynamoDBFinOpsState"
         Effect = "Allow"
         Action = [
           "dynamodb:GetItem",
           "dynamodb:PutItem",
+          "dynamodb:Query",
+          "dynamodb:DeleteItem",
           "dynamodb:DescribeTable",
         ]
-        Resource = aws_dynamodb_table.idempotency.arn
+        Resource = [
+          aws_dynamodb_table.finops_baselines.arn,
+          "${aws_dynamodb_table.finops_baselines.arn}/index/*",
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "cloudtrail_athena" {
+  name = "cloudtrail-athena-query"
+  role = aws_iam_role.lambda_exec.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "CloudTrailLookup"
+        Effect = "Allow"
+        Action = [
+          "cloudtrail:LookupEvents",
+          "cloudtrail:GetTrailStatus",
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "AthenaQueryExecution"
+        Effect = "Allow"
+        Action = [
+          "athena:StartQueryExecution",
+          "athena:GetQueryExecution",
+          "athena:GetQueryResults",
+          "athena:StopQueryExecution",
+          "athena:GetWorkGroup",
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "S3CloudTrailRead"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:ListBucket",
+        ]
+        Resource = var.cloudtrail_s3_bucket != "" ? [
+          "arn:aws:s3:::${var.cloudtrail_s3_bucket}",
+          "arn:aws:s3:::${var.cloudtrail_s3_bucket}/*",
+        ] : ["arn:aws:s3:::placeholder-bucket"]
+      },
+      {
+        Sid    = "S3AthenaResults"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:ListBucket",
+          "s3:GetBucketLocation",
+        ]
+        Resource = var.athena_results_bucket != "" ? [
+          "arn:aws:s3:::${var.athena_results_bucket}",
+          "arn:aws:s3:::${var.athena_results_bucket}/*",
+        ] : ["arn:aws:s3:::placeholder-results-bucket"]
+      },
+      {
+        Sid    = "GlueReadForAthena"
+        Effect = "Allow"
+        Action = [
+          "glue:GetDatabase",
+          "glue:GetTable",
+          "glue:GetPartitions",
+        ]
+        Resource = "*"
+      },
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "compute_optimizer" {
+  name = "compute-optimizer-read"
+  role = aws_iam_role.lambda_exec.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "ComputeOptimizerRead"
+        Effect = "Allow"
+        Action = [
+          "compute-optimizer:GetEC2InstanceRecommendations",
+          "compute-optimizer:GetLambdaFunctionRecommendations",
+          "compute-optimizer:GetEBSVolumeRecommendations",
+          "compute-optimizer:GetEnrollmentStatus",
+        ]
+        Resource = "*"
       }
     ]
   })
@@ -236,22 +331,19 @@ resource "aws_lambda_function" "cost_anomaly_detector" {
 
   environment {
     variables = {
-      AWS_REGION          = var.aws_region
-      ES_HOST             = var.es_host
-      ES_PORT             = tostring(var.es_port)
-      ES_SCHEME           = var.es_scheme
-      ES_INDEX_PREFIX     = var.es_index_prefix
-      ES_DEPLOY_INDEX_PREFIX = var.es_deploy_index_prefix
-      ES_INFRA_INDEX_PREFIX  = var.es_infra_index_prefix
-      ES_VERIFY_CERTS     = tostring(var.es_verify_certs)
-      SLACK_WEBHOOK_URL   = var.slack_webhook_url
-      BEDROCK_MODEL_ID    = var.bedrock_model_id
-      COST_THRESHOLD_PCT  = tostring(var.cost_threshold_pct)
-      COST_DASHBOARD_URL  = var.cost_dashboard_url
-      DYNAMODB_TABLE      = aws_dynamodb_table.idempotency.name
-      ROLLING_WINDOW_DAYS = tostring(var.rolling_window_days)
-      ES_HISTORICAL_DAYS  = tostring(var.es_historical_days)
-      LOG_LEVEL           = var.log_level
+      AWS_REGION              = var.aws_region
+      BEDROCK_MODEL_ID        = var.bedrock_model_id
+      SLACK_WEBHOOK_URL       = var.slack_webhook_url
+      COST_THRESHOLD_PCT      = tostring(var.cost_threshold_pct)
+      COST_DASHBOARD_URL      = var.cost_dashboard_url
+      DYNAMODB_TABLE_NAME     = aws_dynamodb_table.finops_baselines.name
+      ROLLING_WINDOW_DAYS     = tostring(var.rolling_window_days)
+      CLOUDTRAIL_S3_BUCKET    = var.cloudtrail_s3_bucket
+      CLOUDTRAIL_S3_PREFIX    = var.cloudtrail_s3_prefix
+      ATHENA_RESULTS_BUCKET   = var.athena_results_bucket
+      ATHENA_DATABASE         = var.athena_database
+      ATHENA_TABLE            = var.athena_table
+      LOG_LEVEL               = var.log_level
     }
   }
 
@@ -262,34 +354,6 @@ resource "aws_lambda_function" "cost_anomaly_detector" {
 
   tags = {
     Name = "${var.project_name}-${var.environment}"
-  }
-}
-
-# ---------------------------------------------------------------------------
-# DynamoDB Table — Idempotency
-# ---------------------------------------------------------------------------
-
-resource "aws_dynamodb_table" "idempotency" {
-  name         = "${var.project_name}-${var.environment}-idempotency"
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "execution_date"
-
-  attribute {
-    name = "execution_date"
-    type = "S"
-  }
-
-  ttl {
-    attribute_name = "ttl"
-    enabled        = true
-  }
-
-  point_in_time_recovery {
-    enabled = false
-  }
-
-  tags = {
-    Name = "${var.project_name}-${var.environment}-idempotency"
   }
 }
 
@@ -355,8 +419,8 @@ resource "aws_cloudwatch_metric_alarm" "lambda_duration" {
   namespace           = "AWS/Lambda"
   period              = 300
   statistic           = "Average"
-  # Alert when average duration exceeds 50 seconds (out of 60s timeout)
-  threshold          = 50000
+  # Alert when average duration exceeds 100 seconds (out of 120s timeout)
+  threshold          = 100000
   alarm_description  = "Cost anomaly detector Lambda approaching timeout limit"
   treat_missing_data = "notBreaching"
   unit               = "Milliseconds"

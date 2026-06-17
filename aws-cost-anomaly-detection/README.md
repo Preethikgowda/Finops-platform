@@ -1,113 +1,69 @@
-# AWS Cost Anomaly Detector
+# AWS FinOps Cost Anomaly Detection Platform
 
-An automated AWS cost anomaly detection system that runs daily as a Lambda function.
-It fetches your AWS spend via Cost Explorer, compares it against a 7-day rolling average,
-and — when costs spike above a configurable threshold — uses Amazon Bedrock Claude Sonnet 3.5
-to analyze probable root causes (correlated with deployment events from Elasticsearch) and
-send a rich Slack alert.
-
----
-
-## What It Does
-
-```
-EventBridge (daily @ 08:00 UTC)
-        │
-        ▼
-┌───────────────────┐
-│  Lambda Handler   │◄──── DynamoDB (idempotency)
-└───────┬───────────┘
-        │
-        ├─► Cost Explorer API ──► yesterday's cost
-        │
-        ├─► Elasticsearch ──────► 7-day historical costs
-        │                          deployment events (24h)
-        │                          infrastructure changes (24h)
-        │
-        ├─► Anomaly Detection ──► > 15% above baseline?
-        │                            (configurable threshold)
-        │
-        ├─► Bedrock Claude 3.5 ► root cause analysis
-        │                         severity classification
-        │                         recommendations
-        │
-        └─► Slack Webhook ──────► rich alert with blocks
-```
+Serverless AWS cost monitoring system that detects daily cost anomalies,
+correlates them with CloudTrail resource changes, and delivers AI-powered
+root-cause analysis via Amazon Nova Pro — all without Elasticsearch.
 
 ---
 
 ## Architecture
 
-| Component | Technology |
-|---|---|
-| Compute | AWS Lambda (Python 3.11, 512 MB, 60s timeout) |
-| Scheduler | Amazon EventBridge (cron, configurable hour) |
-| Cost data | AWS Cost Explorer API |
-| Historical data + logs | Elasticsearch 8.x (cloud or self-hosted) |
-| AI analysis | Amazon Bedrock — Claude Sonnet 3.5 via Converse API |
-| Alerting | Slack incoming webhook (Block Kit) |
-| Idempotency | Amazon DynamoDB |
-| Observability | CloudWatch Logs + X-Ray tracing |
-| Infrastructure | Terraform ≥ 1.5 |
+```
+┌─────────────────┐
+│  CloudWatch     │
+│   Events        │  (Triggers daily at 8 AM UTC)
+└────────┬────────┘
+         │
+         ▼
+┌──────────────────────────────────────┐
+│   AWS Lambda (120 sec timeout)       │
+│   Region: ap-south-1 (Mumbai)        │
+├──────────────────────────────────────┤
+│ 1. Cost Explorer API                 │
+│    (yesterday's cost)                │
+│                                      │
+│ 2. DynamoDB                          │
+│    (7-day baseline + idempotency)    │
+│                                      │
+│ 3. CloudTrail → Athena               │
+│    (EC2, ASG, RDS, IAM changes)      │
+│                                      │
+│ 4. Compute Optimizer API             │
+│    (rightsizing recommendations)     │
+│                                      │
+│ 5. Bedrock Amazon Nova Pro           │
+│    (root cause analysis)             │
+│                                      │
+│ 6. Slack Webhook                     │
+│    (enriched alert with findings)    │
+│                                      │
+│ 7. DynamoDB                          │
+│    (store baseline + record run)     │
+└──────────────────────────────────────┘
+```
+
+### Key Design Decisions
+
+| Component | Choice | Reason |
+|---|---|---|
+| AI model | Amazon Nova Pro (`amazon.nova-pro-v1:0`) | AWS-native, lower cost/token than Claude, supports Converse API, optimised for AWS analysis |
+| Event correlation | CloudTrail + Athena | Serverless, no infra to manage, accurate source-of-truth for all AWS API calls |
+| State management | DynamoDB | Handles baselines, idempotency, and 30-min CloudTrail result cache |
+| Cost rightsizing | Compute Optimizer | Native AWS API, no extra tooling |
+| Baseline window | 7 days stored in DynamoDB | Removes Elasticsearch dependency entirely |
 
 ---
 
-## AWS Prerequisites
+## Why Amazon Nova Pro?
 
-Before deploying, ensure the following are configured in your AWS account:
+- **Cost-effective**: Lower price per token compared to Claude models
+- **Fast inference**: Well-suited for daily scheduled Lambda tasks
+- **AWS-native**: No cross-vendor API dependencies; runs in your AWS account
+- **Converse API**: Same API interface as Claude — drop-in migration
+- **AWS-aware**: Trained on AWS documentation; understands service-level context
+- **Agent-ready**: Supports Amazon Bedrock Agents for future Phase 2 automation
 
-1. **Cost Explorer enabled** — go to [Billing > Cost Explorer](https://console.aws.amazon.com/cost-management/home) and click "Enable Cost Explorer". Changes take up to 24 hours to propagate.
-
-2. **Bedrock model access** — request access to Claude Sonnet 3.5 in [Bedrock Model Access](https://console.aws.amazon.com/bedrock/home#/modelaccess). Must be in a region where Bedrock is available (e.g. `us-east-1`, `us-west-2`, `eu-west-3`).
-
-3. **Elasticsearch cluster** — a reachable cluster (Elastic Cloud, self-hosted, or Amazon OpenSearch). The Lambda must have network access (VPC peering or public endpoint).
-
-4. **Slack App** — create an app at [api.slack.com](https://api.slack.com/apps), enable "Incoming Webhooks", and copy the webhook URL.
-
-5. **AWS CLI configured** — run `aws configure` or use an IAM role/instance profile.
-
----
-
-## Quick Start
-
-### 1. Clone and install
-
-```bash
-git clone <repo-url>
-cd aws-cost-anomaly-detection
-make install-dev
-```
-
-### 2. Configure environment
-
-```bash
-cp .env.example .env
-# Edit .env — fill in ES_HOST, SLACK_WEBHOOK_URL, etc.
-```
-
-### 3. Run tests
-
-```bash
-make test
-# or with coverage report:
-make test-cov
-```
-
-### 4. Run locally
-
-```bash
-make run-local
-```
-
-### 5. Deploy to AWS
-
-```bash
-cd terraform
-cp terraform.tfvars.example terraform.tfvars
-# Edit terraform.tfvars with your values
-cd ..
-make deploy
-```
+Model pricing: <https://aws.amazon.com/bedrock/pricing/>
 
 ---
 
@@ -116,259 +72,261 @@ make deploy
 ```
 aws-cost-anomaly-detection/
 ├── src/
-│   ├── cost_analyzer.py          # Cost Explorer API + anomaly detection
-│   ├── bedrock_agent.py          # Bedrock Claude Sonnet 3.5 integration
-│   ├── elasticsearch_client.py   # ES connectivity + queries
-│   ├── slack_notifier.py         # Slack Block Kit alerts
-│   └── lambda_handler.py         # Lambda entry point + orchestration
+│   ├── lambda_handler.py          # Orchestration pipeline entry point
+│   ├── cost_analyzer.py           # Cost Explorer + anomaly detection
+│   ├── cloudtrail_client.py       # CloudTrail queries via Athena
+│   ├── bedrock_agent.py           # Amazon Nova Pro analysis
+│   ├── compute_optimizer_client.py# Rightsizing recommendations
+│   ├── dynamodb_store.py          # State management + caching
+│   ├── slack_notifier.py          # Slack Block Kit alert formatting
+│   └── utils.py                   # Date helpers and shared utilities
 ├── tests/
+│   ├── conftest.py
 │   ├── test_cost_analyzer.py
+│   ├── test_cloudtrail_client.py
 │   ├── test_bedrock_agent.py
-│   ├── test_elasticsearch_client.py
-│   ├── test_slack_notifier.py
-│   └── test_lambda_handler.py
+│   ├── test_compute_optimizer_client.py
+│   ├── test_dynamodb_store.py
+│   ├── test_lambda_handler.py
+│   └── test_slack_notifier.py
 ├── terraform/
-│   ├── main.tf                   # Lambda, IAM, DynamoDB, EventBridge, alarms
-│   ├── variables.tf              # All configurable inputs
-│   ├── outputs.tf                # Deployment outputs
-│   └── terraform.tfvars.example  # Template for your values
-├── .env.example                  # Local development config template
-├── requirements.txt              # Production dependencies (pinned)
-├── requirements-dev.txt          # Dev/test dependencies
-├── Makefile                      # make install, test, deploy, logs, …
-└── README.md
+│   ├── main.tf                    # Lambda, IAM, EventBridge, CloudWatch
+│   ├── dynamodb.tf                # DynamoDB table + GSI + alarms
+│   ├── cloudtrail_queries.tf      # Athena workgroup + named queries
+│   ├── variables.tf
+│   └── outputs.tf
+├── requirements.txt               # boto3 only — no elasticsearch
+├── Makefile
+└── .env.example
+```
+
+---
+
+## Prerequisites
+
+1. **AWS Account** in `ap-south-1` (Mumbai) — or update `AWS_REGION`
+2. **Cost Explorer** enabled in your AWS account
+3. **CloudTrail** enabled and logging to an S3 bucket
+4. **Athena** database + table set up for CloudTrail logs (see below)
+5. **Amazon Bedrock** access to `amazon.nova-pro-v1:0` in `ap-south-1`
+6. **AWS Compute Optimizer** enrolled (free; enable in the console)
+7. **Slack Incoming Webhook** URL configured
+
+---
+
+## Quick Start
+
+### 1. Install dependencies
+
+```bash
+make install
+```
+
+### 2. Configure environment
+
+```bash
+cp .env.example .env
+# Edit .env with your values
+```
+
+### 3. Set up CloudTrail → Athena
+
+Create the Athena database and table using the AWS Console:
+
+1. Open **Athena** in the AWS Console
+2. Create database: `CREATE DATABASE cloudtrail_logs;`
+3. Create the CloudTrail table using the [AWS CloudTrail Athena query wizard](https://docs.aws.amazon.com/athena/latest/ug/cloudtrail-logs.html)
+4. Set `ATHENA_DATABASE=cloudtrail_logs` and `ATHENA_TABLE=cloudtrail` in your `.env`
+
+### 4. Deploy with Terraform
+
+```bash
+cd terraform
+cp terraform.tfvars.example terraform.tfvars
+# Edit terraform.tfvars
+terraform init
+terraform plan
+terraform apply
+```
+
+### 5. Run tests
+
+```bash
+make test
 ```
 
 ---
 
 ## Configuration Reference
 
-All configuration is via environment variables (or `.env` for local dev).
-
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `AWS_REGION` | No | `us-east-1` | AWS region for all API calls |
-| `ES_HOST` | **Yes** | — | Elasticsearch hostname |
-| `ES_PORT` | No | `9200` | Elasticsearch port |
-| `ES_SCHEME` | No | `https` | `http` or `https` |
-| `ES_USERNAME` | No | — | Basic-auth username |
-| `ES_PASSWORD` | No | — | Basic-auth password |
-| `ES_API_KEY` | No | — | Elasticsearch API key (preferred over basic auth) |
-| `ES_CA_CERTS` | No | — | Path to CA bundle for TLS |
-| `ES_VERIFY_CERTS` | No | `true` | Set to `false` only in dev |
-| `ES_INDEX_PREFIX` | No | `aws-costs` | Cost data index prefix |
-| `ES_DEPLOY_INDEX_PREFIX` | No | `deployment-logs` | Deployment events index prefix |
-| `ES_INFRA_INDEX_PREFIX` | No | `infra-events` | Infrastructure changes index prefix |
-| `ES_HISTORICAL_DAYS` | No | `30` | Days of history to query from ES |
+| `AWS_REGION` | No | `ap-south-1` | AWS region |
 | `SLACK_WEBHOOK_URL` | **Yes** | — | Slack incoming webhook URL |
-| `COST_DASHBOARD_URL` | No | — | Optional cost dashboard URL for Slack button |
-| `BEDROCK_MODEL_ID` | No | `anthropic.claude-3-5-sonnet-20241022-v2:0` | Bedrock model |
-| `COST_THRESHOLD_PCT` | No | `15.0` | Anomaly threshold (% above rolling average) |
-| `ROLLING_WINDOW_DAYS` | No | `7` | Days in rolling average baseline |
-| `DYNAMODB_TABLE` | No | `cost-anomaly-idempotency` | DynamoDB idempotency table |
-| `LOG_LEVEL` | No | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR` |
+| `BEDROCK_MODEL_ID` | No | `amazon.nova-pro-v1:0` | Bedrock model identifier |
+| `DYNAMODB_TABLE_NAME` | No | `finops-cost-baselines` | DynamoDB table name |
+| `CLOUDTRAIL_S3_BUCKET` | No | — | S3 bucket with CloudTrail logs |
+| `CLOUDTRAIL_S3_PREFIX` | No | `AWSLogs/` | CloudTrail S3 key prefix |
+| `ATHENA_RESULTS_BUCKET` | No | — | S3 bucket for Athena results |
+| `ATHENA_DATABASE` | No | `cloudtrail_logs` | Athena database name |
+| `ATHENA_TABLE` | No | `cloudtrail` | Athena table name |
+| `COST_THRESHOLD_PCT` | No | `15.0` | % increase to trigger alert |
+| `ROLLING_WINDOW_DAYS` | No | `7` | Days in baseline window |
+| `COST_DASHBOARD_URL` | No | — | Dashboard URL in Slack alert |
+| `LOG_LEVEL` | No | `INFO` | Python log level |
 
 ---
 
-## Elasticsearch Index Schemas
+## DynamoDB Table Schema
 
-### Cost data index (`aws-costs-*`)
+Table: `finops-cost-baselines` (configurable)
 
-```json
-{
-  "@timestamp": "2024-01-14T00:00:00Z",
-  "total_cost_usd": 123.45,
-  "service": "AmazonEC2",
-  "account_id": "123456789012",
-  "region": "us-east-1"
-}
-```
+| Attribute | Type | Description |
+|---|---|---|
+| `execution_date` (PK) | String | ISO date `YYYY-MM-DD` |
+| `metric_type` (SK) | String | `baseline` / `anomaly` / `cloudtrail_cache` / `idempotency` |
+| `cost_usd` | Number | Daily cost (baseline records) |
+| `analysis_id` | String | Unique analysis run ID |
+| `expiration_time` | Number | Unix epoch TTL (auto-deleted by DynamoDB) |
+| `updated_at` | String | ISO 8601 timestamp |
 
-### Deployment events index (`deployment-logs-*`)
-
-```json
-{
-  "@timestamp": "2024-01-15T10:30:00Z",
-  "event_type": "deployment",
-  "service": "api-gateway",
-  "description": "Deployed v2.1.0 to production",
-  "author": "ci-pipeline",
-  "environment": "prod"
-}
-```
-
-Valid `event_type` values: `deployment`, `release`, `infrastructure_change`, `scaling_event`, `config_update`
-
-### Infrastructure changes index (`infra-events-*`)
-
-```json
-{
-  "@timestamp": "2024-01-15T11:00:00Z",
-  "change_type": "auto_scaling",
-  "service": "ec2-asg-prod",
-  "description": "Scaled from 3 to 8 instances",
-  "region": "us-east-1"
-}
-```
-
-Valid `change_type` values: `auto_scaling`, `manual_scaling`, `instance_launch`, `instance_termination`, `config_change`, `ami_update`, `security_group_change`
+GSI: `metric_type-execution_date-index` — enables date-range queries by metric type.
 
 ---
 
-## Example Elasticsearch Queries
+## CloudTrail Queries
 
-Query yesterday's cost data:
+The platform queries CloudTrail via Athena for the following event types in the past 24 hours:
 
-```bash
-curl -X GET "https://your-es-host:9200/aws-costs-*/_search" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "query": {
-      "range": {
-        "@timestamp": {
-          "gte": "now-1d/d",
-          "lte": "now/d"
-        }
-      }
-    },
-    "sort": [{"@timestamp": {"order": "desc"}}],
-    "size": 1
-  }'
-```
+| Category | Events Tracked |
+|---|---|
+| EC2 Launches | `RunInstances` |
+| Auto Scaling | `CreateAutoScalingGroup`, `UpdateAutoScalingGroup`, `SetDesiredCapacity`, `ExecutePolicy` |
+| RDS Changes | `CreateDBInstance`, `ModifyDBInstance`, `CreateDBCluster`, `ModifyDBCluster` |
+| IAM Changes | `CreateRole`, `AttachRolePolicy`, `PutRolePolicy`, `CreatePolicy` |
 
-Query recent deployments:
-
-```bash
-curl -X GET "https://your-es-host:9200/deployment-logs-*/_search" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "query": {
-      "bool": {
-        "must": [
-          {"range": {"@timestamp": {"gte": "now-24h"}}},
-          {"term": {"event_type": "deployment"}}
-        ]
-      }
-    },
-    "size": 20
-  }'
-```
+CloudTrail query results are cached in DynamoDB for 30 minutes to avoid duplicate Athena charges.
 
 ---
 
 ## Example Slack Alert
 
 ```
-🔴 AWS Cost Anomaly — HIGH Severity
-─────────────────────────────────────
-Analysis Date    │ 2024-01-15
-Analysis ID      │ a3f9b12c
-Yesterday's Cost │ $1,423.50
-7-Day Baseline   │ $982.00
-Cost Delta       │ +$441.50
-Increase         │ +44.9%
-─────────────────────────────────────
-🔍 Root Cause Analysis
-The 44.9% cost increase correlates strongly with the API Gateway v2.1.0
-deployment at 10:30 UTC. The new version introduced an additional Lambda
-invocation per request and increased DynamoDB provisioned capacity.
+🔴 AWS Cost Anomaly Detected — HIGH Severity
+
+Analysis Date: 2024-01-15  |  Analysis ID: ab12cd34
+Yesterday's Cost: $625.00  |  7-Day Baseline: $500.00
+Cost Delta: +$125.00       |  Increase: +25.0%
+
+🔍 Root Cause Analysis (Amazon Nova Pro)
+The cost increase correlates with infrastructure scale-out events
+detected in CloudTrail. 3x m5.xlarge instances were launched.
 
 💡 Probable Root Causes
-• API Gateway Lambda integration change doubled invocation count
-• DynamoDB capacity autoscaling triggered by new access patterns
-• Data transfer increase due to larger response payloads
+• 3x m5.xlarge EC2 instances launched in production
+• Auto Scaling group scaled from 3 to 8 instances
 
-🚀 Recent Deployment Events (Last 24h)
-• 2024-01-15T10:30:00Z deployment — api-gateway: Deployed v2.1.0
-• 2024-01-15T11:00:00Z auto_scaling — ec2-asg-prod: Scaled to 8 instances
+☁️ CloudTrail Resource Changes (Last 24h)
+EC2 Launches (3 instances):
+  • [2024-01-15T10:00:00Z] by deploy-bot
+Auto Scaling Changes (2 events):
+  • [2024-01-15T11:00:00Z] SetDesiredCapacity
 
 📋 Recommended Actions
-1. Review Lambda invocation count in CloudWatch for the api-gateway function
-2. Check DynamoDB capacity units consumed vs provisioned before/after deployment
-3. Consider reverting v2.1.0 if cost impact is unacceptable
-4. Enable AWS Cost Anomaly Detection for automated baseline alerts
+1. Review EC2 instance types for right-sizing (save $95/month)
+2. Enable Reserved Instances for predictable workloads
+3. Review Auto Scaling policies and target capacities
 
-[📊 Open Cost Dashboard]
+💰 Compute Optimizer Opportunities
+Estimated monthly savings: $145.00
 
-🕐 Generated at 2024-01-15T08:05:23Z UTC | Analysis ID: a3f9b12c
+🕐 2024-01-15T08:05:00Z UTC  |  ID: ab12cd34  |  Model: amazon.nova-pro-v1:0
 ```
+
+---
+
+## IAM Permissions Required
+
+The Lambda execution role needs:
+
+```
+ce:GetCostAndUsage
+bedrock:InvokeModel, bedrock:Converse  (for amazon.nova-pro-v1:0)
+dynamodb:GetItem, PutItem, Query, DeleteItem
+cloudtrail:LookupEvents
+athena:StartQueryExecution, GetQueryExecution, GetQueryResults
+s3:GetObject, ListBucket  (CloudTrail and Athena results buckets)
+glue:GetDatabase, GetTable, GetPartitions  (for Athena)
+compute-optimizer:GetEC2InstanceRecommendations
+compute-optimizer:GetLambdaFunctionRecommendations
+compute-optimizer:GetEBSVolumeRecommendations
+logs:CreateLogGroup, CreateLogStream, PutLogEvents
+xray:PutTraceSegments, PutTelemetryRecords
+```
+
+All permissions are provisioned by `terraform/main.tf`.
 
 ---
 
 ## Makefile Reference
 
-| Command | Description |
+| Target | Description |
 |---|---|
 | `make install` | Install production dependencies |
-| `make install-dev` | Install all dependencies (includes dev/test tools) |
-| `make test` | Run all unit tests |
-| `make test-cov` | Run tests with coverage report (fails below 80%) |
-| `make lint` | Run flake8 linter |
-| `make format` | Auto-format with black |
-| `make typecheck` | Run mypy type checking |
-| `make build` | Package Lambda source into a zip |
-| `make deploy` | Full Terraform deploy (init + plan + apply) |
-| `make tf-plan` | Show Terraform plan without applying |
-| `make invoke` | Manually invoke the Lambda via AWS CLI |
-| `make logs` | Tail live CloudWatch logs |
-| `make logs-last` | Show the last 60 minutes of logs |
-| `make run-local` | Run the handler locally (requires `.env`) |
-| `make env-check` | Validate `.env` against `.env.example` |
-| `make clean` | Remove build artifacts |
-
----
-
-## IAM Permissions
-
-The Lambda execution role is granted least-privilege access to:
-
-| Service | Actions |
-|---|---|
-| Cost Explorer | `GetCostAndUsage`, `GetCostForecast`, `GetDimensionValues`, `GetUsageForecast` |
-| Bedrock | `InvokeModel`, `Converse` (scoped to the configured model ARN) |
-| CloudWatch Logs | `CreateLogGroup`, `CreateLogStream`, `PutLogEvents` |
-| X-Ray | `PutTraceSegments`, `PutTelemetryRecords` |
-| DynamoDB | `GetItem`, `PutItem`, `DescribeTable` (scoped to idempotency table) |
-
----
-
-## Error Handling & Graceful Degradation
-
-| Failure | Behavior |
-|---|---|
-| AWS Cost Explorer down | Returns 500; pipeline aborted (cost data is required) |
-| Elasticsearch unreachable | Historical costs default to empty list; analysis continues with Cost Explorer data only |
-| Bedrock unavailable | Fallback response used with heuristic severity; Slack alert still sent |
-| Slack webhook failure | Logged as error; Lambda returns 200 (alert failure is non-fatal) |
-| DynamoDB idempotency table missing | Warning logged; pipeline proceeds without idempotency guarantee |
+| `make install-dev` | Install dev + test dependencies |
+| `make test` | Run test suite |
+| `make test-cov` | Run tests with ≥80% coverage report |
+| `make lint` | Run ruff linter |
+| `make format` | Auto-format with black/ruff |
+| `make build` | Package Lambda zip |
+| `make deploy` | Terraform apply |
+| `make invoke` | Invoke Lambda manually |
+| `make logs` | Tail CloudWatch logs |
 
 ---
 
 ## Local Development
 
-1. Copy `.env.example` → `.env` and fill in values.
-2. Configure AWS credentials via `aws configure` or environment variables.
-3. Run `make install-dev` to install all dependencies.
-4. Run `make test` to validate everything works.
-5. Run `make run-local` to simulate a Lambda invocation.
+```bash
+# Install dev dependencies
+make install-dev
 
-For integration testing against a real Elasticsearch cluster, set `ES_HOST` and credentials in `.env`.
+# Run all tests with coverage
+make test-cov
+
+# Run specific test module
+pytest tests/test_cloudtrail_client.py -v
+
+# Lint
+make lint
+```
 
 ---
 
 ## Monitoring
 
-- **CloudWatch Logs**: all Lambda output is written to `/aws/lambda/{function-name}` in structured JSON format compatible with CloudWatch Insights.
-- **CloudWatch Alarms**: two alarms are deployed automatically:
-  - Error alarm: fires when any Lambda invocation returns an error.
-  - Duration alarm: fires when average execution time exceeds 50 seconds.
-- **X-Ray**: active tracing is enabled; view traces in the [X-Ray console](https://console.aws.amazon.com/xray/home).
+- **Lambda errors**: CloudWatch alarm triggers when `Errors ≥ 1`
+- **Lambda duration**: CloudWatch alarm triggers when average duration > 100s
+- **DynamoDB throttling**: CloudWatch alarm on `SystemErrors ≥ 5`
+- **Structured logs**: All Lambda logs are JSON-structured for CloudWatch Insights
+- **Token tracking**: Nova Pro input/output tokens logged for cost monitoring
 
-### Sample CloudWatch Insights Query
+---
 
-```
-fields @timestamp, level, message, anomaly_detected, yesterday_cost_usd, percentage_increase
-| filter logger = "lambda_handler"
-| sort @timestamp desc
-| limit 20
-```
+## Migration from Elasticsearch
+
+This project replaces Elasticsearch with:
+
+| Old (ES) | New |
+|---|---|
+| `elasticsearch_client.py` | `cloudtrail_client.py` |
+| Historical cost data in ES | DynamoDB baseline storage |
+| Deployment events in ES | CloudTrail + Athena queries |
+| Claude Sonnet 4.6 | Amazon Nova Pro (`amazon.nova-pro-v1:0`) |
+| `ES_HOST`, `ES_PORT`, etc. | `CLOUDTRAIL_S3_BUCKET`, `DYNAMODB_TABLE_NAME`, etc. |
+
+Benefits:
+- No ES cluster to manage or pay for
+- CloudTrail provides authoritative, tamper-proof AWS event history
+- DynamoDB is cheaper and simpler than ES for time-series key lookups
+- Nova Pro is more cost-effective per token than Claude Sonnet

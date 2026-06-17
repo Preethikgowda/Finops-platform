@@ -3,13 +3,13 @@
 import json
 import os
 import sys
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 # Set required env vars before importing the module
-os.environ.setdefault("ES_HOST", "localhost")
 os.environ.setdefault("SLACK_WEBHOOK_URL", "https://hooks.slack.com/test")
+os.environ.setdefault("DYNAMODB_TABLE_NAME", "finops-cost-baselines")
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -23,13 +23,15 @@ class MockContext:
 def _mock_env(overrides: dict | None = None):
     """Return a minimal valid environment dict for Config."""
     env = {
-        "ES_HOST": "localhost",
-        "ES_PORT": "9200",
         "SLACK_WEBHOOK_URL": "https://hooks.slack.com/test",
-        "AWS_REGION": "us-east-1",
-        "BEDROCK_MODEL_ID": "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        "AWS_REGION": "ap-south-1",
+        "BEDROCK_MODEL_ID": "amazon.nova-pro-v1:0",
         "COST_THRESHOLD_PCT": "15.0",
-        "DYNAMODB_TABLE": "cost-idempotency",
+        "DYNAMODB_TABLE_NAME": "finops-cost-baselines",
+        "CLOUDTRAIL_S3_BUCKET": "my-cloudtrail-bucket",
+        "ATHENA_RESULTS_BUCKET": "my-athena-results",
+        "ATHENA_DATABASE": "cloudtrail_logs",
+        "ATHENA_TABLE": "cloudtrail",
     }
     if overrides:
         env.update(overrides)
@@ -38,14 +40,6 @@ def _mock_env(overrides: dict | None = None):
 
 class TestConfig:
     """Tests for Config validation."""
-
-    def test_raises_on_missing_es_host(self):
-        from lambda_handler import Config
-
-        env = _mock_env({"ES_HOST": ""})
-        with patch.dict(os.environ, env, clear=True):
-            with pytest.raises(EnvironmentError, match="ES_HOST"):
-                Config()
 
     def test_raises_on_missing_slack_webhook(self):
         from lambda_handler import Config
@@ -64,81 +58,50 @@ class TestConfig:
             cfg = Config()
         assert cfg.cost_threshold_pct == pytest.approx(15.0)
 
-    def test_defaults_aws_region(self):
+    def test_defaults_aws_region_to_ap_south_1(self):
         from lambda_handler import Config
 
         env = _mock_env()
         env.pop("AWS_REGION", None)
         with patch.dict(os.environ, env, clear=True):
             cfg = Config()
-        assert cfg.aws_region == "us-east-1"
+        assert cfg.aws_region == "ap-south-1"
 
+    def test_default_bedrock_model_is_nova_pro(self):
+        from lambda_handler import Config
 
-class TestIdempotency:
-    """Tests for DynamoDB idempotency helpers."""
+        env = _mock_env()
+        env.pop("BEDROCK_MODEL_ID", None)
+        with patch.dict(os.environ, env, clear=True):
+            cfg = Config()
+        assert cfg.bedrock_model_id == "amazon.nova-pro-v1:0"
 
-    def test_check_returns_true_when_record_exists(self):
-        from lambda_handler import _check_idempotency
+    def test_default_dynamodb_table_is_finops_baselines(self):
+        from lambda_handler import Config
 
-        mock_table = MagicMock()
-        mock_table.get_item.return_value = {"Item": {"execution_date": "2024-01-15"}}
+        env = _mock_env()
+        env.pop("DYNAMODB_TABLE_NAME", None)
+        with patch.dict(os.environ, env, clear=True):
+            cfg = Config()
+        assert cfg.dynamodb_table == "finops-cost-baselines"
 
-        with patch("lambda_handler.boto3.resource") as mock_resource:
-            mock_resource.return_value.Table.return_value = mock_table
-            result = _check_idempotency("my-table", "2024-01-15", "us-east-1")
+    def test_no_es_host_required(self):
+        """The new config must NOT require ES_HOST."""
+        from lambda_handler import Config
 
-        assert result is True
+        env = _mock_env()
+        # Explicitly ensure ES_HOST is absent — should not raise
+        with patch.dict(os.environ, env, clear=True):
+            cfg = Config()
+        assert not hasattr(cfg, "es_host")
 
-    def test_check_returns_false_when_no_record(self):
-        from lambda_handler import _check_idempotency
+    def test_athena_results_bucket_normalised_to_s3_uri(self):
+        from lambda_handler import Config
 
-        mock_table = MagicMock()
-        mock_table.get_item.return_value = {}  # No "Item" key
-
-        with patch("lambda_handler.boto3.resource") as mock_resource:
-            mock_resource.return_value.Table.return_value = mock_table
-            result = _check_idempotency("my-table", "2024-01-15", "us-east-1")
-
-        assert result is False
-
-    def test_check_returns_false_on_boto_error(self):
-        from botocore.exceptions import ClientError
-        from lambda_handler import _check_idempotency
-
-        error_response = {"Error": {"Code": "ResourceNotFoundException", "Message": "Table not found"}}
-        with patch("lambda_handler.boto3.resource") as mock_resource:
-            mock_resource.return_value.Table.side_effect = ClientError(error_response, "Table")
-            result = _check_idempotency("missing-table", "2024-01-15", "us-east-1")
-
-        assert result is False
-
-    def test_record_execution_writes_to_dynamo(self):
-        from lambda_handler import _record_execution
-
-        mock_table = MagicMock()
-        with patch("lambda_handler.boto3.resource") as mock_resource:
-            mock_resource.return_value.Table.return_value = mock_table
-            _record_execution(
-                "my-table",
-                "2024-01-15",
-                "abc123",
-                "us-east-1",
-                {"anomaly_detected": True},
-            )
-
-        mock_table.put_item.assert_called_once()
-        item = mock_table.put_item.call_args[1]["Item"]
-        assert item["execution_date"] == "2024-01-15"
-        assert item["analysis_id"] == "abc123"
-
-    def test_record_execution_tolerates_boto_error(self):
-        from botocore.exceptions import BotoCoreError
-        from lambda_handler import _record_execution
-
-        with patch("lambda_handler.boto3.resource") as mock_resource:
-            mock_resource.return_value.Table.return_value.put_item.side_effect = BotoCoreError()
-            # Should not raise
-            _record_execution("table", "2024-01-15", "id", "us-east-1", {})
+        env = _mock_env({"ATHENA_RESULTS_BUCKET": "my-results-bucket"})
+        with patch.dict(os.environ, env, clear=True):
+            cfg = Config()
+        assert cfg.athena_results_bucket.startswith("s3://")
 
 
 class TestHandlerIntegration:
@@ -169,27 +132,45 @@ class TestHandlerIntegration:
 
         return BedrockAnalysisResult(
             anomaly_severity="HIGH",
-            probable_root_causes=["EC2 spike"],
-            explanation="Explanation",
-            recommendations=["Review EC2"],
+            probable_root_causes=["EC2 scale-out detected via CloudTrail"],
+            explanation="Nova Pro analysis: cost spike due to EC2 launch events.",
+            recommendations=["Review EC2 instance types", "Use Compute Optimizer"],
             input_tokens=300,
             output_tokens=100,
+            model_id="amazon.nova-pro-v1:0",
             is_fallback=False,
         )
+
+    def _empty_cloudtrail(self) -> dict:
+        return {
+            "ec2_launches": [],
+            "autoscaling_changes": [],
+            "rds_changes": [],
+            "iam_changes": [],
+            "total_events": 0,
+            "query_window_hours": 24,
+        }
+
+    def _empty_optimizer(self) -> dict:
+        return {
+            "ec2": [], "lambda": [], "ebs": [],
+            "total_savings_usd": 0.0, "total_recommendations": 0,
+        }
 
     def test_returns_200_when_no_anomaly(self):
         env = _mock_env()
         handler = self._get_handler()
 
         with patch.dict(os.environ, env, clear=True):
-            with patch("lambda_handler._check_idempotency", return_value=False):
-                with patch("lambda_handler._stage_fetch_historical_costs", return_value=[100.0] * 7):
+            with patch("lambda_handler.check_idempotency", return_value=False):
+                with patch("lambda_handler._stage_fetch_baseline_costs", return_value=[100.0] * 7):
                     with patch(
                         "lambda_handler.run_cost_analysis",
                         return_value=self._make_cost_result(anomaly_detected=False, pct=5.0),
                     ):
-                        with patch("lambda_handler._record_execution"):
-                            result = handler({}, MockContext())
+                        with patch("lambda_handler.store_cost_baseline"):
+                            with patch("lambda_handler.record_idempotency"):
+                                result = handler({}, MockContext())
 
         assert result["statusCode"] == 200
         body = json.loads(result["body"])
@@ -200,37 +181,44 @@ class TestHandlerIntegration:
         handler = self._get_handler()
 
         with patch.dict(os.environ, env, clear=True):
-            with patch("lambda_handler._check_idempotency", return_value=False):
-                with patch("lambda_handler._stage_fetch_historical_costs", return_value=[100.0] * 7):
+            with patch("lambda_handler.check_idempotency", return_value=False):
+                with patch("lambda_handler._stage_fetch_baseline_costs", return_value=[100.0] * 7):
                     with patch(
                         "lambda_handler.run_cost_analysis",
                         return_value=self._make_cost_result(anomaly_detected=True),
                     ):
-                        with patch(
-                            "lambda_handler._stage_fetch_deployment_context",
-                            return_value=([], []),
-                        ):
+                        with patch("lambda_handler.store_cost_baseline"):
                             with patch(
-                                "lambda_handler._stage_bedrock_analysis",
-                                return_value=self._make_bedrock_result(),
+                                "lambda_handler._stage_fetch_cloudtrail_changes",
+                                return_value=self._empty_cloudtrail(),
                             ):
                                 with patch(
-                                    "lambda_handler._stage_send_alert", return_value=True
+                                    "lambda_handler._stage_fetch_compute_optimizer",
+                                    return_value=self._empty_optimizer(),
                                 ):
-                                    with patch("lambda_handler._record_execution"):
-                                        result = handler({}, MockContext())
+                                    with patch(
+                                        "lambda_handler._stage_bedrock_analysis",
+                                        return_value=self._make_bedrock_result(),
+                                    ):
+                                        with patch("lambda_handler.store_anomaly_result"):
+                                            with patch(
+                                                "lambda_handler._stage_send_alert", return_value=True
+                                            ):
+                                                with patch("lambda_handler.record_idempotency"):
+                                                    result = handler({}, MockContext())
 
         assert result["statusCode"] == 200
         body = json.loads(result["body"])
         assert body["anomaly_detected"] is True
         assert body["slack_alert_sent"] is True
+        assert body["model_id"] == "amazon.nova-pro-v1:0"
 
     def test_skips_when_already_ran_today(self):
         env = _mock_env()
         handler = self._get_handler()
 
         with patch.dict(os.environ, env, clear=True):
-            with patch("lambda_handler._check_idempotency", return_value=True):
+            with patch("lambda_handler.check_idempotency", return_value=True):
                 result = handler({}, MockContext())
 
         assert result["statusCode"] == 200
@@ -238,10 +226,9 @@ class TestHandlerIntegration:
         assert "already completed" in body["message"]
 
     def test_returns_500_on_missing_config(self):
-        # Missing both required vars
         handler = self._get_handler()
 
-        with patch.dict(os.environ, {"ES_HOST": "", "SLACK_WEBHOOK_URL": ""}, clear=True):
+        with patch.dict(os.environ, {"SLACK_WEBHOOK_URL": ""}, clear=True):
             result = handler({}, MockContext())
 
         assert result["statusCode"] == 500
@@ -253,8 +240,8 @@ class TestHandlerIntegration:
         handler = self._get_handler()
 
         with patch.dict(os.environ, env, clear=True):
-            with patch("lambda_handler._check_idempotency", return_value=False):
-                with patch("lambda_handler._stage_fetch_historical_costs", return_value=[100.0]):
+            with patch("lambda_handler.check_idempotency", return_value=False):
+                with patch("lambda_handler._stage_fetch_baseline_costs", return_value=[100.0]):
                     with patch(
                         "lambda_handler.run_cost_analysis",
                         side_effect=AWSException("CE API unavailable"),
@@ -269,25 +256,31 @@ class TestHandlerIntegration:
         handler = self._get_handler()
 
         with patch.dict(os.environ, env, clear=True):
-            with patch("lambda_handler._check_idempotency", return_value=False):
-                with patch("lambda_handler._stage_fetch_historical_costs", return_value=[100.0] * 7):
+            with patch("lambda_handler.check_idempotency", return_value=False):
+                with patch("lambda_handler._stage_fetch_baseline_costs", return_value=[100.0] * 7):
                     with patch(
                         "lambda_handler.run_cost_analysis",
                         return_value=self._make_cost_result(anomaly_detected=True),
                     ):
-                        with patch(
-                            "lambda_handler._stage_fetch_deployment_context",
-                            return_value=([], []),
-                        ):
+                        with patch("lambda_handler.store_cost_baseline"):
                             with patch(
-                                "lambda_handler._stage_bedrock_analysis",
-                                return_value=self._make_bedrock_result(),
+                                "lambda_handler._stage_fetch_cloudtrail_changes",
+                                return_value=self._empty_cloudtrail(),
                             ):
                                 with patch(
-                                    "lambda_handler._stage_send_alert", return_value=False
+                                    "lambda_handler._stage_fetch_compute_optimizer",
+                                    return_value=self._empty_optimizer(),
                                 ):
-                                    with patch("lambda_handler._record_execution"):
-                                        result = handler({}, MockContext())
+                                    with patch(
+                                        "lambda_handler._stage_bedrock_analysis",
+                                        return_value=self._make_bedrock_result(),
+                                    ):
+                                        with patch("lambda_handler.store_anomaly_result"):
+                                            with patch(
+                                                "lambda_handler._stage_send_alert", return_value=False
+                                            ):
+                                                with patch("lambda_handler.record_idempotency"):
+                                                    result = handler({}, MockContext())
 
         assert result["statusCode"] == 200
         body = json.loads(result["body"])
@@ -298,14 +291,62 @@ class TestHandlerIntegration:
         handler = self._get_handler()
 
         with patch.dict(os.environ, env, clear=True):
-            with patch("lambda_handler._check_idempotency", return_value=False):
-                with patch("lambda_handler._stage_fetch_historical_costs", return_value=[100.0] * 7):
+            with patch("lambda_handler.check_idempotency", return_value=False):
+                with patch("lambda_handler._stage_fetch_baseline_costs", return_value=[100.0] * 7):
                     with patch(
                         "lambda_handler.run_cost_analysis",
                         return_value=self._make_cost_result(anomaly_detected=False),
                     ):
-                        with patch("lambda_handler._record_execution"):
-                            result = handler({}, MockContext())
+                        with patch("lambda_handler.store_cost_baseline"):
+                            with patch("lambda_handler.record_idempotency"):
+                                result = handler({}, MockContext())
 
         assert "executionTime" in result
         assert isinstance(result["executionTime"], int)
+
+    def test_response_includes_cloudtrail_events_count(self):
+        env = _mock_env()
+        handler = self._get_handler()
+        cloudtrail_with_events = {
+            **self._empty_cloudtrail(),
+            "ec2_launches": [{"eventtime": "2024-01-15"}],
+            "total_events": 1,
+        }
+
+        with patch.dict(os.environ, env, clear=True):
+            with patch("lambda_handler.check_idempotency", return_value=False):
+                with patch("lambda_handler._stage_fetch_baseline_costs", return_value=[100.0] * 7):
+                    with patch(
+                        "lambda_handler.run_cost_analysis",
+                        return_value=self._make_cost_result(anomaly_detected=True),
+                    ):
+                        with patch("lambda_handler.store_cost_baseline"):
+                            with patch(
+                                "lambda_handler._stage_fetch_cloudtrail_changes",
+                                return_value=cloudtrail_with_events,
+                            ):
+                                with patch(
+                                    "lambda_handler._stage_fetch_compute_optimizer",
+                                    return_value=self._empty_optimizer(),
+                                ):
+                                    with patch(
+                                        "lambda_handler._stage_bedrock_analysis",
+                                        return_value=self._make_bedrock_result(),
+                                    ):
+                                        with patch("lambda_handler.store_anomaly_result"):
+                                            with patch(
+                                                "lambda_handler._stage_send_alert", return_value=True
+                                            ):
+                                                with patch("lambda_handler.record_idempotency"):
+                                                    result = handler({}, MockContext())
+
+        body = json.loads(result["body"])
+        assert body["cloudtrail_events"] == 1
+
+    def test_no_elasticsearch_in_handler(self):
+        """Verify no Elasticsearch references remain in lambda_handler."""
+        import lambda_handler
+        import inspect
+        source = inspect.getsource(lambda_handler)
+        assert "elasticsearch" not in source.lower()
+        assert "ES_HOST" not in source

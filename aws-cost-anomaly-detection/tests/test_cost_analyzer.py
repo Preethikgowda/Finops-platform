@@ -16,6 +16,7 @@ from cost_analyzer import (
     calculate_rolling_average,
     detect_anomaly,
     fetch_yesterday_cost,
+    get_correlated_changes,
     run_cost_analysis,
 )
 
@@ -44,7 +45,7 @@ class TestFetchYesterdayCost:
             mock_ce.get_cost_and_usage.return_value = mock_response
             mock_builder.return_value = mock_ce
 
-            cost = fetch_yesterday_cost(region="us-east-1")
+            cost = fetch_yesterday_cost(region="ap-south-1")
 
         assert cost == pytest.approx(123.45)
 
@@ -86,7 +87,7 @@ class TestFetchYesterdayCost:
             mock_ce.get_cost_and_usage.side_effect = ClientError(error_response, "GetCostAndUsage")
             mock_builder.return_value = mock_ce
 
-            with patch("cost_analyzer.time.sleep"):  # Bypass sleep in tests
+            with patch("cost_analyzer.time.sleep"):
                 with pytest.raises(AWSException):
                     fetch_yesterday_cost()
 
@@ -127,6 +128,22 @@ class TestFetchYesterdayCost:
             assert call_kwargs["TimePeriod"]["Start"] == yesterday
             assert call_kwargs["TimePeriod"]["End"] == today
 
+    def test_default_region_is_ap_south_1(self):
+        """Default region should be ap-south-1 for Mumbai deployment."""
+        mock_response = {
+            "ResultsByTime": [
+                {"Total": {"UnblendedCost": {"Amount": "50.00", "Unit": "USD"}}}
+            ]
+        }
+        with patch("cost_analyzer._build_cost_explorer_client") as mock_builder:
+            mock_ce = MagicMock()
+            mock_ce.get_cost_and_usage.return_value = mock_response
+            mock_builder.return_value = mock_ce
+
+            fetch_yesterday_cost()
+
+        mock_builder.assert_called_once_with("ap-south-1")
+
 
 # ---------------------------------------------------------------------------
 # calculate_rolling_average
@@ -154,6 +171,11 @@ class TestCalculateRollingAverage:
         avg = calculate_rolling_average(costs)
         assert avg == pytest.approx(sum(costs) / len(costs))
 
+    def test_error_message_mentions_dynamodb(self):
+        """Error message should reference DynamoDB (not Elasticsearch)."""
+        with pytest.raises(CostDataError, match="DynamoDB"):
+            calculate_rolling_average([])
+
 
 # ---------------------------------------------------------------------------
 # detect_anomaly
@@ -175,7 +197,6 @@ class TestDetectAnomaly:
         anomaly, delta, pct = detect_anomaly(
             yesterday_cost=115.0, baseline_cost=100.0, threshold_pct=15.0
         )
-        # Exactly at threshold (not strictly above) → no anomaly
         assert anomaly is False
         assert pct == pytest.approx(15.0)
 
@@ -208,6 +229,57 @@ class TestDetectAnomaly:
         )
         assert anomaly is True
         assert pct == pytest.approx(5.0)
+
+
+# ---------------------------------------------------------------------------
+# get_correlated_changes (CloudTrail — replaces ES deployment events)
+# ---------------------------------------------------------------------------
+
+
+class TestGetCorrelatedChanges:
+    """Tests for get_correlated_changes() — CloudTrail integration."""
+
+    def test_returns_summary_on_success(self):
+        expected_summary = {
+            "ec2_launches": [{"eventtime": "2024-01-15T10:00:00Z"}],
+            "autoscaling_changes": [],
+            "rds_changes": [],
+            "iam_changes": [],
+            "total_events": 1,
+            "query_window_hours": 24,
+        }
+        # patch the module-level function in cloudtrail_client, which cost_analyzer imports locally
+        with patch("cloudtrail_client.get_resource_changes_summary", return_value=expected_summary):
+            result = get_correlated_changes(
+                cloudtrail_database="cloudtrail_logs",
+                cloudtrail_table="cloudtrail",
+                results_bucket="s3://my-results",
+                region="ap-south-1",
+            )
+
+        assert result["total_events"] == 1
+        assert len(result["ec2_launches"]) == 1
+
+    def test_returns_empty_summary_on_exception(self):
+        with patch("cloudtrail_client.get_resource_changes_summary", side_effect=Exception("Athena timeout")):
+            result = get_correlated_changes(
+                cloudtrail_database="cloudtrail_logs",
+                cloudtrail_table="cloudtrail",
+                results_bucket="s3://my-results",
+                region="ap-south-1",
+            )
+
+        assert result["total_events"] == 0
+        assert result["ec2_launches"] == []
+        assert result["autoscaling_changes"] == []
+
+    def test_no_elasticsearch_imports(self):
+        """Verify no Elasticsearch-related imports remain in cost_analyzer."""
+        import cost_analyzer
+        import inspect
+        source = inspect.getsource(cost_analyzer)
+        assert "elasticsearch" not in source.lower()
+        assert "from elasticsearch" not in source
 
 
 # ---------------------------------------------------------------------------
