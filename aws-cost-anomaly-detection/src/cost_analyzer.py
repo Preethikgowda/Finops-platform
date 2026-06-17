@@ -286,6 +286,7 @@ def run_cost_analysis(
     historical_costs: list[float],
     region: str = "ap-south-1",
     threshold_pct: float = 15.0,
+    _override_yesterday_cost: Optional[float] = None,
 ) -> CostAnalysisResult:
     """Orchestrate full cost anomaly analysis.
 
@@ -298,6 +299,8 @@ def run_cost_analysis(
                           (typically the last 7 days from DynamoDB).
         region: AWS region used by Cost Explorer.
         threshold_pct: Percentage increase above baseline that triggers anomaly.
+        _override_yesterday_cost: Optional cost override for testing/demo purposes.
+                                   When set, skips the Cost Explorer API call.
 
     Returns:
         :class:`CostAnalysisResult` with all analysis fields populated.
@@ -313,7 +316,11 @@ def run_cost_analysis(
         extra={"analysis_date": analysis_date, "threshold_pct": threshold_pct},
     )
 
-    yesterday_cost = fetch_yesterday_cost(region=region)
+    if _override_yesterday_cost is not None:
+        yesterday_cost = float(_override_yesterday_cost)
+        logger.info("Using overridden yesterday cost: %.4f USD", yesterday_cost)
+    else:
+        yesterday_cost = fetch_yesterday_cost(region=region)
     baseline_cost = calculate_rolling_average(historical_costs)
     anomaly_detected, cost_delta, percentage_increase = detect_anomaly(
         yesterday_cost=yesterday_cost,

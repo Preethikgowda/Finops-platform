@@ -38,6 +38,31 @@ output "athena_workgroup_name" {
   value       = aws_athena_workgroup.finops_cloudtrail.name
 }
 
+output "cloudtrail_s3_bucket" {
+  description = "S3 bucket name where CloudTrail logs are stored."
+  value       = aws_s3_bucket.cloudtrail.id
+}
+
+output "athena_results_s3_bucket" {
+  description = "S3 bucket name for Athena query results."
+  value       = aws_s3_bucket.athena_results.id
+}
+
+output "cloudtrail_trail_arn" {
+  description = "ARN of the CloudTrail trail."
+  value       = aws_cloudtrail.finops.arn
+}
+
+output "glue_database_name" {
+  description = "Name of the Glue database for CloudTrail Athena queries."
+  value       = aws_glue_catalog_database.cloudtrail.name
+}
+
+output "glue_table_name" {
+  description = "Name of the Glue table for CloudTrail logs."
+  value       = aws_glue_catalog_table.cloudtrail_logs.name
+}
+
 output "account_id" {
   description = "AWS account ID where resources are deployed."
   value       = data.aws_caller_identity.current.account_id

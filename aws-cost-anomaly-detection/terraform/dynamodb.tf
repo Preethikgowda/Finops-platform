@@ -47,8 +47,7 @@ resource "aws_dynamodb_table" "finops_baselines" {
   }
 
   tags = {
-    Name        = var.dynamodb_table_name
-    Description = "FinOps cost baselines, anomaly results, and CloudTrail cache"
+    Name = var.dynamodb_table_name
   }
 }
 

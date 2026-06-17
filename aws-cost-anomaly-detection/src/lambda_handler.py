@@ -784,15 +784,69 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
     # ------------------------------------------------------------------
     # 4. Fetch yesterday's cost and detect anomaly
+    # Test mode: pass {"_test_yesterday_cost": 99.99} in the Lambda event
+    # to simulate a cost spike without needing real Cost Explorer data.
     # ------------------------------------------------------------------
     t0 = time.monotonic()
+    _test_cost_override = event.get("_test_yesterday_cost")
+    if _test_cost_override is not None:
+        logger.info(
+            "TEST MODE: Using injected yesterday_cost=%.4f instead of Cost Explorer.",
+            float(_test_cost_override),
+        )
     try:
         cost_result = run_cost_analysis(
             historical_costs=historical_costs,
             region=cfg.aws_region,
             threshold_pct=cfg.cost_threshold_pct,
+            _override_yesterday_cost=float(_test_cost_override) if _test_cost_override is not None else None,
         )
-    except (AWSException, CostDataError) as exc:
+    except CostDataError as exc:
+        # No usable baseline yet (first run, or all-zero costs). Store yesterday's
+        # cost as the seed baseline and exit gracefully — no anomaly can be measured.
+        logger.warning(
+            "Insufficient baseline data for anomaly detection (%s). "
+            "Storing today's cost as initial baseline for future runs.",
+            exc,
+            extra={"request_id": request_id},
+        )
+        # Attempt to store a seed baseline so next run can compare
+        try:
+            from cost_analyzer import fetch_yesterday_cost
+            yesterday_cost = fetch_yesterday_cost(region=cfg.aws_region)
+            store_cost_baseline(
+                table_name=cfg.dynamodb_table,
+                execution_date=analysis_date,
+                cost_usd=yesterday_cost,
+                region=cfg.aws_region,
+            )
+            logger.info(
+                "Seed baseline stored",
+                extra={"execution_date": analysis_date, "cost_usd": yesterday_cost},
+            )
+        except Exception as seed_exc:
+            logger.warning("Could not store seed baseline: %s", seed_exc)
+
+        record_idempotency(
+            cfg.dynamodb_table,
+            execution_date,
+            analysis_id,
+            {"anomaly_detected": False, "reason": "insufficient_baseline"},
+            cfg.aws_region,
+        )
+        return {
+            "statusCode": 200,
+            "body": json.dumps(
+                {
+                    "message": "Baseline initialised. No anomaly detection on first run.",
+                    "execution_date": execution_date,
+                    "request_id": request_id,
+                    "reason": "insufficient_baseline",
+                }
+            ),
+            "executionTime": int((time.monotonic() - pipeline_start) * 1000),
+        }
+    except AWSException as exc:
         logger.error(
             "Cost analysis failed — cannot proceed: %s",
             exc,
