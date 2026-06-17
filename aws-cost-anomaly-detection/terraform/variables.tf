@@ -194,3 +194,77 @@ variable "rolling_window_days" {
     error_message = "rolling_window_days must be between 1 and 90."
   }
 }
+
+# ---------------------------------------------------------------------------
+# CS-07 Cost Optimization Extensions
+# ---------------------------------------------------------------------------
+
+variable "github_token" {
+  description = "GitHub personal access token (or App installation token) for Terraform PR creation. Leave empty to disable auto-PR generation."
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "github_repo" {
+  description = "GitHub repository in owner/repo format for auto-generated Terraform PRs."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.github_repo == "" || can(regex("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", var.github_repo))
+    error_message = "github_repo must be empty or in owner/repo format (e.g. my-org/my-repo)."
+  }
+}
+
+variable "github_branch_main" {
+  description = "Default base branch for auto-generated Terraform PRs."
+  type        = string
+  default     = "main"
+}
+
+variable "weekly_digest_enabled" {
+  description = "When true, a weekly cost digest is sent to Slack on the configured digest day."
+  type        = bool
+  default     = true
+}
+
+variable "weekly_digest_day" {
+  description = "Day of the week to send the weekly digest (0=Monday … 6=Sunday). Default 4=Friday."
+  type        = number
+  default     = 4
+
+  validation {
+    condition     = var.weekly_digest_day >= 0 && var.weekly_digest_day <= 6
+    error_message = "weekly_digest_day must be between 0 (Monday) and 6 (Sunday)."
+  }
+}
+
+variable "cost_center_tag_name" {
+  description = "AWS tag key used for cost-centre attribution (used in Cost Explorer grouping and tag compliance)."
+  type        = string
+  default     = "CostCenter"
+}
+
+variable "required_tag_list" {
+  description = "Comma-separated list of tag keys that every resource must have. Used by the tag compliance engine."
+  type        = list(string)
+  default     = ["CostCenter", "Project", "Environment", "Owner"]
+}
+
+variable "tf_pr_min_recommendations" {
+  description = "Minimum number of right-sizing recommendations required before a Terraform PR is created."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.tf_pr_min_recommendations >= 1
+    error_message = "tf_pr_min_recommendations must be at least 1."
+  }
+}
+
+variable "tf_pr_reviewers" {
+  description = "Comma-separated list of GitHub usernames to request as reviewers on auto-generated Terraform PRs."
+  type        = string
+  default     = ""
+}
