@@ -1,4 +1,4 @@
-"""AWS Lambda Handler for FinOps Cost Anomaly Detection.
+"""AWS Lambda Handler for FinOps Cost Anomaly Detection (CS-07 Extended).
 
 Orchestrates the full pipeline:
 1. Check DynamoDB for today's execution (idempotency)
@@ -13,6 +13,13 @@ Orchestrates the full pipeline:
    e. Post to Slack with findings
 6. Store baseline for next run
 7. Return success/failure response
+
+CS-07 extensions (always executed after the above):
+- Utilization analysis (EC2 + RDS) — daily, results cached 24 h
+- Auto-generate Terraform PRs for significant right-sizing recommendations
+- S3 lifecycle analysis — weekly (Fridays)
+- Tag compliance scan — daily
+- Weekly cost digest replacing daily alert on Fridays
 """
 
 import json
@@ -22,7 +29,7 @@ import time
 import uuid
 from dataclasses import asdict
 from datetime import date, timezone, datetime, timedelta
-from typing import Any
+from typing import Any, Optional
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
@@ -45,6 +52,18 @@ from dynamodb_store import (
 from slack_notifier import SlackException, send_anomaly_alert
 from utils import get_7day_baseline_dates
 
+# CS-07 extension modules
+import utilization_analyzer
+import savings_optimizer
+import s3_lifecycle_optimizer
+import tag_compliance_engine
+import weekly_digest_generator
+try:
+    import terraform_pr_generator
+    _TF_PR_AVAILABLE = True
+except ImportError:
+    _TF_PR_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Logging — structured JSON for CloudWatch Insights
 # ---------------------------------------------------------------------------
@@ -54,6 +73,12 @@ logging.basicConfig(
     format='{"time": "%(asctime)s", "level": "%(levelname)s", "logger": "%(name)s", "message": %(message)s}',
 )
 logger = logging.getLogger(__name__)
+
+if not _TF_PR_AVAILABLE:
+    logger.warning(
+        "PyGithub not installed — Terraform PR generation is disabled. "
+        "Install with: pip install 'PyGithub>=2.1.0'"
+    )
 
 # ---------------------------------------------------------------------------
 # Configuration helpers
@@ -121,6 +146,27 @@ class Config:
         if self.athena_results_bucket and not self.athena_results_bucket.startswith("s3://"):
             self.athena_results_bucket = f"s3://{self.athena_results_bucket}"
 
+        # CS-07 extended configuration
+        self.github_token: str = _get_env("GITHUB_TOKEN", "")
+        self.github_repo: str = _get_env("GITHUB_REPO", "")
+        self.github_branch_main: str = _get_env("GITHUB_BRANCH_MAIN", "main")
+        self.weekly_digest_enabled: bool = _get_env("WEEKLY_DIGEST_ENABLED", "true").lower() != "false"
+        self.weekly_digest_day: int = int(_get_env("WEEKLY_DIGEST_DAY", "4"))  # 4 = Friday
+        self.cost_center_tag_name: str = _get_env("COST_CENTER_TAG_NAME", "CostCenter")
+        self.required_tag_list: list[str] = [
+            t.strip()
+            for t in _get_env(
+                "REQUIRED_TAG_LIST", "CostCenter,Project,Environment,Owner"
+            ).split(",")
+            if t.strip()
+        ]
+        self.tf_pr_min_recommendations: int = int(_get_env("TF_PR_MIN_RECOMMENDATIONS", "1"))
+        self.tf_pr_reviewers: list[str] = [
+            r.strip()
+            for r in _get_env("TF_PR_REVIEWERS", "").split(",")
+            if r.strip()
+        ]
+
     def log_summary(self) -> None:
         """Log non-secret configuration values for audit trail."""
         logger.info(
@@ -133,6 +179,9 @@ class Config:
                 "dynamodb_table": self.dynamodb_table,
                 "cloudtrail_s3_bucket": self.cloudtrail_s3_bucket,
                 "athena_database": self.athena_database,
+                "weekly_digest_enabled": self.weekly_digest_enabled,
+                "weekly_digest_day": self.weekly_digest_day,
+                "github_repo": self.github_repo or "(not configured)",
             },
         )
 
@@ -362,6 +411,283 @@ def _stage_send_alert(
 
 
 # ---------------------------------------------------------------------------
+# CS-07 pipeline stages
+# ---------------------------------------------------------------------------
+
+def _stage_utilization_analysis(cfg: Config) -> dict[str, Any]:
+    """Run EC2 and RDS utilization analysis; store results for weekly digest.
+
+    Args:
+        cfg: Validated configuration object.
+
+    Returns:
+        Dict with ``ec2`` and ``rds`` underutilised instance lists.
+    """
+    t0 = time.monotonic()
+    try:
+        ec2_under = utilization_analyzer.get_underutilized_ec2_instances(
+            region=cfg.aws_region,
+            table_name=cfg.dynamodb_table,
+        )
+        rds_under = utilization_analyzer.get_underutilized_rds_instances(
+            region=cfg.aws_region,
+            table_name=cfg.dynamodb_table,
+        )
+        logger.info(
+            "Utilization analysis complete",
+            extra={
+                "underutilized_ec2": len(ec2_under),
+                "underutilized_rds": len(rds_under),
+                "elapsed_ms": int((time.monotonic() - t0) * 1000),
+            },
+        )
+        return {"ec2": ec2_under, "rds": rds_under}
+    except Exception as exc:
+        logger.warning("Utilization analysis failed (non-fatal): %s", exc)
+        return {"ec2": [], "rds": []}
+
+
+def _stage_terraform_pr(
+    cfg: Config,
+    ec2_recommendations: list[dict[str, Any]],
+    rds_recommendations: list[dict[str, Any]],
+) -> Optional[str]:
+    """Auto-generate Terraform PR if significant recommendations exist.
+
+    Args:
+        cfg: Validated configuration object.
+        ec2_recommendations: EC2 right-sizing recommendations.
+        rds_recommendations: RDS right-sizing recommendations.
+
+    Returns:
+        PR URL string if created, ``None`` otherwise.
+    """
+    if not _TF_PR_AVAILABLE:
+        logger.debug("Terraform PR generation skipped — PyGithub not available")
+        return None
+
+    if not cfg.github_token or not cfg.github_repo:
+        logger.info(
+            "Terraform PR generation skipped — GITHUB_TOKEN or GITHUB_REPO not configured"
+        )
+        return None
+
+    all_recs = ec2_recommendations + rds_recommendations
+    if len(all_recs) < cfg.tf_pr_min_recommendations:
+        logger.info(
+            "Fewer than %d recommendations (%d) — skipping Terraform PR creation",
+            cfg.tf_pr_min_recommendations,
+            len(all_recs),
+        )
+        return None
+
+    t0 = time.monotonic()
+    try:
+        today = date.today().isoformat()
+        tf_changes: dict[str, str] = {}
+
+        if ec2_recommendations:
+            tf_changes[f"terraform/auto-generated/ec2-rightsizing-{today}.tf"] = (
+                terraform_pr_generator.generate_ec2_downsizing_terraform(ec2_recommendations)
+            )
+        if rds_recommendations:
+            tf_changes[f"terraform/auto-generated/rds-rightsizing-{today}.tf"] = (
+                terraform_pr_generator.generate_rds_downsizing_terraform(rds_recommendations)
+            )
+
+        total_ec2_savings = sum(r.get("estimated_savings", 0) for r in ec2_recommendations)
+        total_rds_savings = sum(r.get("estimated_savings", 0) for r in rds_recommendations)
+        total_savings = total_ec2_savings + total_rds_savings
+        annual_savings = total_savings * 12
+
+        resource_ids = [r.get("instance_id", "") for r in all_recs]
+        changes = [
+            {
+                "resource_id": r.get("instance_id", ""),
+                "from": r.get("current_type", r.get("instance_class", "")),
+                "to": r.get("recommended_type", r.get("recommended_class", "")),
+                "monthly_savings": r.get("estimated_savings", 0),
+                "risk": terraform_pr_generator.estimate_change_risk(
+                    "ec2" if "current_type" in r else "rds",
+                    r.get("current_type", r.get("instance_class", "")),
+                    r.get("recommended_type", r.get("recommended_class", "")),
+                ).get("risk_level", "unknown"),
+            }
+            for r in all_recs
+        ]
+
+        title = (
+            f"Cost Optimization: Rightsize {len(all_recs)} resources "
+            f"(est. ${annual_savings:,.0f}/yr savings)"
+        )
+        description = terraform_pr_generator.build_pr_description(
+            changes=changes,
+            annual_savings=annual_savings,
+            risk_summary="Mixed risk — review each change individually.",
+            affected_resources=resource_ids,
+        )
+
+        pr_url = terraform_pr_generator.commit_and_create_github_pr(
+            tf_changes=tf_changes,
+            title=title,
+            description=description,
+            reviewers=cfg.tf_pr_reviewers or None,
+        )
+        logger.info(
+            "Terraform PR created",
+            extra={
+                "pr_url": pr_url,
+                "recommendations": len(all_recs),
+                "annual_savings": annual_savings,
+                "elapsed_ms": int((time.monotonic() - t0) * 1000),
+            },
+        )
+        return pr_url
+    except Exception as exc:
+        logger.warning("Terraform PR creation failed (non-fatal): %s", exc)
+        return None
+
+
+def _stage_s3_lifecycle_analysis(cfg: Config) -> list[dict[str, Any]]:
+    """Run S3 access pattern analysis for lifecycle recommendations.
+
+    Args:
+        cfg: Validated configuration object.
+
+    Returns:
+        List of S3 lifecycle recommendation dicts.
+    """
+    t0 = time.monotonic()
+    try:
+        results = s3_lifecycle_optimizer.analyze_s3_access_patterns(
+            region=cfg.aws_region,
+            table_name=cfg.dynamodb_table,
+        )
+        logger.info(
+            "S3 lifecycle analysis complete",
+            extra={
+                "buckets_flagged": len(results),
+                "elapsed_ms": int((time.monotonic() - t0) * 1000),
+            },
+        )
+        return results
+    except Exception as exc:
+        logger.warning("S3 lifecycle analysis failed (non-fatal): %s", exc)
+        return []
+
+
+def _stage_tag_compliance_scan(cfg: Config) -> list[dict[str, Any]]:
+    """Scan for untagged resources across EC2, RDS, S3, and Lambda.
+
+    Args:
+        cfg: Validated configuration object.
+
+    Returns:
+        List of untagged resource dicts.
+    """
+    t0 = time.monotonic()
+    try:
+        results = tag_compliance_engine.scan_untagged_resources(
+            region=cfg.aws_region,
+            table_name=cfg.dynamodb_table,
+            required_tags=cfg.required_tag_list,
+        )
+        logger.info(
+            "Tag compliance scan complete",
+            extra={
+                "untagged_resources": len(results),
+                "elapsed_ms": int((time.monotonic() - t0) * 1000),
+            },
+        )
+        return results
+    except Exception as exc:
+        logger.warning("Tag compliance scan failed (non-fatal): %s", exc)
+        return []
+
+
+def _stage_weekly_digest(
+    cfg: Config,
+    utilization_results: dict[str, Any],
+    s3_results: list[dict[str, Any]],
+) -> bool:
+    """Send the weekly cost digest to Slack.
+
+    Args:
+        cfg: Validated configuration object.
+        utilization_results: Dict with ``ec2`` and ``rds`` right-sizing lists.
+        s3_results: S3 lifecycle recommendation list.
+
+    Returns:
+        ``True`` if at least one message was sent successfully.
+    """
+    if not cfg.weekly_digest_enabled:
+        logger.info("Weekly digest is disabled via configuration")
+        return False
+
+    t0 = time.monotonic()
+    try:
+        ec2_monthly = sum(
+            r.get("estimated_savings", 0) for r in utilization_results.get("ec2", [])
+        )
+        rds_monthly = sum(
+            r.get("estimated_savings", 0) for r in utilization_results.get("rds", [])
+        )
+        s3_monthly = sum(r.get("monthly_savings", 0) for r in s3_results)
+
+        result = weekly_digest_generator.send_weekly_team_digest(
+            table_name=cfg.dynamodb_table,
+            region=cfg.aws_region,
+            dashboard_url=cfg.dashboard_url,
+            utilization_savings=ec2_monthly + rds_monthly,
+            ri_savings=0.0,
+            s3_savings=s3_monthly,
+            ec2_opportunities=utilization_results.get("ec2", []),
+            rds_opportunities=utilization_results.get("rds", []),
+        )
+        sent = result.get("messages_sent", 0)
+        logger.info(
+            "Weekly digest sent",
+            extra={
+                "messages_sent": sent,
+                "teams": result.get("teams", []),
+                "elapsed_ms": int((time.monotonic() - t0) * 1000),
+            },
+        )
+        return sent > 0
+    except Exception as exc:
+        logger.error("Weekly digest failed (non-fatal): %s", exc)
+        return False
+
+
+def _stage_ri_analysis(cfg: Config) -> list[dict[str, Any]]:
+    """Run Reserved Instance opportunity analysis.
+
+    Args:
+        cfg: Validated configuration object.
+
+    Returns:
+        List of RI recommendation dicts.
+    """
+    t0 = time.monotonic()
+    try:
+        results = savings_optimizer.analyze_reserved_instance_opportunity(
+            region=cfg.aws_region,
+            table_name=cfg.dynamodb_table,
+        )
+        logger.info(
+            "RI analysis complete",
+            extra={
+                "ri_opportunities": len(results),
+                "elapsed_ms": int((time.monotonic() - t0) * 1000),
+            },
+        )
+        return results
+    except Exception as exc:
+        logger.warning("RI analysis failed (non-fatal): %s", exc)
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Lambda entry point
 # ---------------------------------------------------------------------------
 
@@ -396,6 +722,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     today = date.today()
     execution_date = today.isoformat()
     analysis_date = (today - timedelta(days=1)).isoformat()
+    is_friday = today.weekday() == 4  # 0=Monday, 4=Friday
 
     logger.info(
         "Lambda handler started",
@@ -403,6 +730,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             "request_id": request_id,
             "analysis_id": analysis_id,
             "execution_date": execution_date,
+            "is_friday": is_friday,
         },
     )
 
@@ -514,6 +842,27 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             {"anomaly_detected": False},
             cfg.aws_region,
         )
+
+        # CS-07 stages still run when no anomaly is detected
+        utilization_results = _stage_utilization_analysis(cfg)
+        pr_url = _stage_terraform_pr(
+            cfg,
+            ec2_recommendations=utilization_results.get("ec2", []),
+            rds_recommendations=utilization_results.get("rds", []),
+        )
+        s3_results: list[dict[str, Any]] = []
+        if is_friday:
+            s3_results = _stage_s3_lifecycle_analysis(cfg)
+        untagged_resources = _stage_tag_compliance_scan(cfg)
+        if is_friday:
+            _stage_weekly_digest(cfg, utilization_results, s3_results)
+
+        opportunity_count = (
+            len(utilization_results.get("ec2", []))
+            + len(utilization_results.get("rds", []))
+            + len(s3_results)
+        )
+
         return {
             "statusCode": 200,
             "body": json.dumps(
@@ -524,6 +873,12 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                     "baseline_cost_usd": cost_result.baseline_cost,
                     "percentage_increase": cost_result.percentage_increase,
                     "request_id": request_id,
+                    # CS-07 fields
+                    "underutilized_ec2": len(utilization_results.get("ec2", [])),
+                    "underutilized_rds": len(utilization_results.get("rds", [])),
+                    "terraform_pr_url": pr_url,
+                    "untagged_resources": len(untagged_resources),
+                    "opportunities_found": opportunity_count,
                 }
             ),
             "executionTime": int((time.monotonic() - pipeline_start) * 1000),
@@ -624,10 +979,60 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         cfg.aws_region,
     )
 
+    # ==================================================================
+    # CS-07 EXTENSION STAGES
+    # These run after the core pipeline regardless of anomaly status.
+    # ==================================================================
+
+    # CS-07.1: Utilization analysis (daily; results cached 24 h)
+    t0 = time.monotonic()
+    utilization_results = _stage_utilization_analysis(cfg)
+    metrics["utilization_analysis_ms"] = int((time.monotonic() - t0) * 1000)
+    metrics["underutilized_ec2_count"] = len(utilization_results.get("ec2", []))
+    metrics["underutilized_rds_count"] = len(utilization_results.get("rds", []))
+
+    # CS-07.2: Auto-generate Terraform PR (daily; only when recommendations exist)
+    t0 = time.monotonic()
+    pr_url = _stage_terraform_pr(
+        cfg,
+        ec2_recommendations=utilization_results.get("ec2", []),
+        rds_recommendations=utilization_results.get("rds", []),
+    )
+    metrics["terraform_pr_created"] = pr_url is not None
+    metrics["terraform_pr_url"] = pr_url or ""
+    metrics["terraform_pr_ms"] = int((time.monotonic() - t0) * 1000)
+
+    # CS-07.3: S3 lifecycle analysis (weekly — Fridays only)
+    s3_results: list[dict[str, Any]] = []
+    if is_friday:
+        t0 = time.monotonic()
+        s3_results = _stage_s3_lifecycle_analysis(cfg)
+        metrics["s3_lifecycle_buckets"] = len(s3_results)
+        metrics["s3_lifecycle_ms"] = int((time.monotonic() - t0) * 1000)
+
+    # CS-07.4: Tag compliance scan (daily)
+    t0 = time.monotonic()
+    untagged_resources = _stage_tag_compliance_scan(cfg)
+    metrics["untagged_resources_count"] = len(untagged_resources)
+    metrics["tag_compliance_ms"] = int((time.monotonic() - t0) * 1000)
+
+    # CS-07.5: Weekly digest (Fridays only; replaces daily alert on Fridays)
+    if is_friday:
+        t0 = time.monotonic()
+        digest_sent = _stage_weekly_digest(cfg, utilization_results, s3_results)
+        metrics["weekly_digest_sent"] = digest_sent
+        metrics["weekly_digest_ms"] = int((time.monotonic() - t0) * 1000)
+
     execution_time_ms = int((time.monotonic() - pipeline_start) * 1000)
     metrics["total_execution_ms"] = execution_time_ms
 
     logger.info("Lambda pipeline complete", extra=metrics)
+
+    opportunity_count = (
+        len(utilization_results.get("ec2", []))
+        + len(utilization_results.get("rds", []))
+        + len(s3_results)
+    )
 
     return {
         "statusCode": 200,
@@ -648,6 +1053,12 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                 "analysis_id": analysis_id,
                 "request_id": request_id,
                 "model_id": cfg.bedrock_model_id,
+                # CS-07 fields
+                "underutilized_ec2": metrics.get("underutilized_ec2_count", 0),
+                "underutilized_rds": metrics.get("underutilized_rds_count", 0),
+                "terraform_pr_url": pr_url,
+                "untagged_resources": len(untagged_resources),
+                "opportunities_found": opportunity_count,
                 "metrics": metrics,
             }
         ),
