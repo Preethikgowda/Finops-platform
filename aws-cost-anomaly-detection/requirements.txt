@@ -1,5 +1,6 @@
 # Core AWS SDK — all AWS service calls (Bedrock, Cost Explorer, CloudTrail,
-# Athena, DynamoDB, Compute Optimizer) are made through boto3.
+# Athena, DynamoDB, Compute Optimizer, CloudWatch, Pricing API) are made
+# through boto3.
 boto3>=1.28.0
 botocore>=1.31.0
 
@@ -13,3 +14,7 @@ python-dotenv==1.0.1
 
 # Logging utilities (structured JSON logging)
 python-json-logger==2.0.7
+
+# CS-07: GitHub API client for auto-generating Terraform PRs
+# Optional — if not installed, PR generation is skipped gracefully.
+PyGithub>=2.1.0
