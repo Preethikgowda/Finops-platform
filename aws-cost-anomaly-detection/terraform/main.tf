@@ -6,17 +6,13 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
-    archive = {
-      source  = "hashicorp/archive"
-      version = "~> 2.0"
-    }
   }
 
   # Uncomment and configure for remote state
   # backend "s3" {
   #   bucket         = "your-terraform-state-bucket"
   #   key            = "cost-anomaly-detection/terraform.tfstate"
-  #   region         = "ap-south-1"
+  #   region         = "us-east-1"
   #   encrypt        = true
   #   dynamodb_table = "terraform-lock"
   # }
@@ -43,19 +39,12 @@ data "aws_region" "current" {}
 
 # ---------------------------------------------------------------------------
 # Lambda deployment package
+# Pre-built zip includes src/ + all pip dependencies (requests, python-dotenv, etc.)
+# Build with: pip install -r requirements.txt --target dist/python_deps && make build
 # ---------------------------------------------------------------------------
 
-data "archive_file" "lambda_package" {
-  type        = "zip"
-  source_dir  = "${path.module}/../src"
-  output_path = "${path.module}/../dist/lambda_package.zip"
-
-  excludes = [
-    "__pycache__",
-    "*.pyc",
-    "*.pyo",
-    ".pytest_cache",
-  ]
+locals {
+  lambda_package_path = "${path.module}/../dist/lambda_package.zip"
 }
 
 # ---------------------------------------------------------------------------
@@ -243,10 +232,10 @@ resource "aws_iam_role_policy" "cloudtrail_athena" {
           "s3:GetObject",
           "s3:ListBucket",
         ]
-        Resource = var.cloudtrail_s3_bucket != "" ? [
-          "arn:aws:s3:::${var.cloudtrail_s3_bucket}",
-          "arn:aws:s3:::${var.cloudtrail_s3_bucket}/*",
-        ] : ["arn:aws:s3:::placeholder-bucket"]
+        Resource = [
+          aws_s3_bucket.cloudtrail.arn,
+          "${aws_s3_bucket.cloudtrail.arn}/*",
+        ]
       },
       {
         Sid    = "S3AthenaResults"
@@ -257,10 +246,10 @@ resource "aws_iam_role_policy" "cloudtrail_athena" {
           "s3:ListBucket",
           "s3:GetBucketLocation",
         ]
-        Resource = var.athena_results_bucket != "" ? [
-          "arn:aws:s3:::${var.athena_results_bucket}",
-          "arn:aws:s3:::${var.athena_results_bucket}/*",
-        ] : ["arn:aws:s3:::placeholder-results-bucket"]
+        Resource = [
+          aws_s3_bucket.athena_results.arn,
+          "${aws_s3_bucket.athena_results.arn}/*",
+        ]
       },
       {
         Sid    = "GlueReadForAthena"
@@ -298,6 +287,123 @@ resource "aws_iam_role_policy" "compute_optimizer" {
   })
 }
 
+resource "aws_iam_role_policy" "cloudwatch_metrics" {
+  name = "cloudwatch-metrics-read"
+  role = aws_iam_role.lambda_exec.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "CloudWatchMetricsRead"
+        Effect = "Allow"
+        Action = [
+          "cloudwatch:GetMetricStatistics",
+          "cloudwatch:GetMetricData",
+          "cloudwatch:ListMetrics",
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "ec2_rds_read" {
+  name = "ec2-rds-describe"
+  role = aws_iam_role.lambda_exec.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "EC2DescribeForUtilization"
+        Effect = "Allow"
+        Action = [
+          "ec2:DescribeInstances",
+          "ec2:DescribeInstanceStatus",
+          "ec2:DescribeInstanceTypes",
+          "ec2:DescribeReservedInstances",
+          "ec2:DescribeReservedInstancesOfferings",
+          "ec2:DescribeTags",
+          "ec2:DescribeVolumes",
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "RDSDescribeForUtilization"
+        Effect = "Allow"
+        Action = [
+          "rds:DescribeDBInstances",
+          "rds:DescribeDBClusters",
+          "rds:ListTagsForResource",
+          "rds:DescribeReservedDBInstances",
+          "rds:DescribeReservedDBInstancesOfferings",
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "lambda_s3_read" {
+  name = "lambda-s3-tag-compliance"
+  role = aws_iam_role.lambda_exec.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "LambdaListForTagCompliance"
+        Effect = "Allow"
+        Action = [
+          "lambda:ListFunctions",
+          "lambda:ListTags",
+          "lambda:GetFunctionConfiguration",
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "S3ListForTagCompliance"
+        Effect = "Allow"
+        Action = [
+          "s3:ListAllMyBuckets",
+          "s3:ListBuckets",
+          "s3:GetBucketTagging",
+          "s3:GetBucketLocation",
+          "s3:GetBucketLifecycleConfiguration",
+          "s3:GetBucketLogging",
+          "s3:GetObjectTagging",
+          "s3:ListBucket",
+          "s3:ListObjects",
+          "s3:ListObjectsV2",
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "pricing_api" {
+  name = "pricing-api-read"
+  role = aws_iam_role.lambda_exec.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "PricingAPIRead"
+        Effect = "Allow"
+        Action = [
+          "pricing:GetProducts",
+          "pricing:DescribeServices",
+          "pricing:GetAttributeValues",
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
 # ---------------------------------------------------------------------------
 # CloudWatch Log Group
 # ---------------------------------------------------------------------------
@@ -320,8 +426,8 @@ resource "aws_lambda_function" "cost_anomaly_detector" {
   role             = aws_iam_role.lambda_exec.arn
   handler          = "lambda_handler.handler"
   runtime          = "python3.11"
-  filename         = data.archive_file.lambda_package.output_path
-  source_code_hash = data.archive_file.lambda_package.output_base64sha256
+  filename         = local.lambda_package_path
+  source_code_hash = filebase64sha256(local.lambda_package_path)
   timeout          = var.lambda_timeout_seconds
   memory_size      = var.lambda_memory_mb
 
@@ -331,19 +437,28 @@ resource "aws_lambda_function" "cost_anomaly_detector" {
 
   environment {
     variables = {
-      AWS_REGION              = var.aws_region
       BEDROCK_MODEL_ID        = var.bedrock_model_id
       SLACK_WEBHOOK_URL       = var.slack_webhook_url
       COST_THRESHOLD_PCT      = tostring(var.cost_threshold_pct)
       COST_DASHBOARD_URL      = var.cost_dashboard_url
       DYNAMODB_TABLE_NAME     = aws_dynamodb_table.finops_baselines.name
       ROLLING_WINDOW_DAYS     = tostring(var.rolling_window_days)
-      CLOUDTRAIL_S3_BUCKET    = var.cloudtrail_s3_bucket
+      CLOUDTRAIL_S3_BUCKET    = aws_s3_bucket.cloudtrail.id
       CLOUDTRAIL_S3_PREFIX    = var.cloudtrail_s3_prefix
-      ATHENA_RESULTS_BUCKET   = var.athena_results_bucket
-      ATHENA_DATABASE         = var.athena_database
-      ATHENA_TABLE            = var.athena_table
+      ATHENA_RESULTS_BUCKET   = aws_s3_bucket.athena_results.id
+      ATHENA_DATABASE         = aws_glue_catalog_database.cloudtrail.name
+      ATHENA_TABLE            = aws_glue_catalog_table.cloudtrail_logs.name
       LOG_LEVEL               = var.log_level
+      # CS-07 extended configuration
+      WEEKLY_DIGEST_ENABLED   = tostring(var.weekly_digest_enabled)
+      WEEKLY_DIGEST_DAY       = tostring(var.weekly_digest_day)
+      COST_CENTER_TAG_NAME    = var.cost_center_tag_name
+      REQUIRED_TAG_LIST       = join(",", var.required_tag_list)
+      TF_PR_MIN_RECOMMENDATIONS = tostring(var.tf_pr_min_recommendations)
+      TF_PR_REVIEWERS         = var.tf_pr_reviewers
+      GITHUB_TOKEN            = var.github_token
+      GITHUB_REPO             = var.github_repo
+      GITHUB_BRANCH_MAIN      = var.github_branch_main
     }
   }
 
