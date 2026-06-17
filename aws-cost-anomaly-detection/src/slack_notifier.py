@@ -1,8 +1,9 @@
 """Slack Notifier for AWS Cost Anomaly Alerts.
 
-Formats rich Slack Block Kit messages containing cost anomaly data, AI-generated
-root-cause analysis, deployment events, and recommended actions, then posts them
-to a configured Slack webhook URL.
+Formats rich Slack Block Kit messages containing cost anomaly data, Nova Pro
+AI-generated root-cause analysis, CloudTrail findings, Compute Optimizer
+recommendations, and recommended actions, then posts them to a configured
+Slack webhook URL.
 """
 
 import json
@@ -43,34 +44,63 @@ def _utcnow_iso() -> str:
     return datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _format_deployment_events(events: list[dict[str, Any]], max_events: int = 5) -> str:
-    """Format deployment events as a compact Slack-friendly bullet list.
+def _format_cloudtrail_findings(
+    cloudtrail_summary: Optional[dict[str, Any]],
+    max_events_per_category: int = 3,
+) -> str:
+    """Format CloudTrail resource changes for Slack display.
 
     Args:
-        events: List of deployment event dicts (``event_type``, ``service``,
-                ``description``, ``timestamp`` keys expected).
-        max_events: Maximum number of events to include in the message.
+        cloudtrail_summary: Dict with ec2_launches, autoscaling_changes,
+                            rds_changes, iam_changes keys.
+        max_events_per_category: Max events to show per category.
 
     Returns:
-        Multi-line string suitable for a Slack text block, or a default
-        message when no events are present.
+        Formatted multi-line string or a default message if no events.
     """
-    if not events:
-        return "_No deployment events in the last 24 hours._"
+    if not cloudtrail_summary or cloudtrail_summary.get("total_events", 0) == 0:
+        return "_No CloudTrail resource changes detected in the last 24 hours._"
 
     lines: list[str] = []
-    for event in events[:max_events]:
-        ts = event.get("timestamp", event.get("@timestamp", "unknown"))
-        event_type = event.get("event_type", "event")
-        service = event.get("service", "unknown service")
-        description = event.get("description", "no description")
-        lines.append(f"• `{ts}` *{event_type}* — {service}: {description}")
+    hours = cloudtrail_summary.get("query_window_hours", 24)
 
-    overflow = len(events) - max_events
-    if overflow > 0:
-        lines.append(f"_…and {overflow} more event(s)_")
+    ec2 = cloudtrail_summary.get("ec2_launches", [])
+    if ec2:
+        lines.append(f"*EC2 Launches* ({len(ec2)} instances):")
+        for event in ec2[:max_events_per_category]:
+            ts = event.get("eventtime", "unknown")
+            actor = event.get("useridentity_arn", "").split("/")[-1] or "unknown"
+            lines.append(f"  • `{ts}` by {actor}")
+        if len(ec2) > max_events_per_category:
+            lines.append(f"  _…and {len(ec2) - max_events_per_category} more_")
 
-    return "\n".join(lines)
+    asg = cloudtrail_summary.get("autoscaling_changes", [])
+    if asg:
+        lines.append(f"*Auto Scaling Changes* ({len(asg)} events):")
+        for event in asg[:max_events_per_category]:
+            ts = event.get("eventtime", "unknown")
+            name = event.get("eventname", "unknown")
+            lines.append(f"  • `{ts}` {name}")
+        if len(asg) > max_events_per_category:
+            lines.append(f"  _…and {len(asg) - max_events_per_category} more_")
+
+    rds = cloudtrail_summary.get("rds_changes", [])
+    if rds:
+        lines.append(f"*RDS Changes* ({len(rds)} events):")
+        for event in rds[:max_events_per_category]:
+            ts = event.get("eventtime", "unknown")
+            name = event.get("eventname", "unknown")
+            lines.append(f"  • `{ts}` {name}")
+
+    iam = cloudtrail_summary.get("iam_changes", [])
+    if iam:
+        lines.append(f"*IAM Changes* ({len(iam)} events):")
+        for event in iam[:max_events_per_category]:
+            ts = event.get("eventtime", "unknown")
+            name = event.get("eventname", "unknown")
+            lines.append(f"  • `{ts}` {name}")
+
+    return "\n".join(lines) if lines else "_No significant changes detected._"
 
 
 def _format_recommendations(recommendations: list[str]) -> str:
@@ -99,9 +129,13 @@ def build_slack_message(
     root_causes: list[str],
     explanation: str,
     recommendations: list[str],
-    deployment_events: list[dict[str, Any]],
+    cloudtrail_summary: Optional[dict[str, Any]] = None,
+    compute_optimizer_savings_usd: float = 0.0,
     dashboard_url: str = "",
     analysis_id: Optional[str] = None,
+    model_id: str = "amazon.nova-pro-v1:0",
+    # Legacy parameter kept for backward compatibility
+    deployment_events: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """Build a richly formatted Slack Block Kit message for a cost anomaly alert.
 
@@ -112,13 +146,15 @@ def build_slack_message(
         cost_delta: Difference between yesterday_cost and baseline_cost.
         percentage_increase: Percentage by which costs exceeded baseline.
         severity: Severity classification — HIGH, MEDIUM, or LOW.
-        root_causes: List of probable root cause strings from Bedrock.
-        explanation: Detailed explanation string from Bedrock.
-        recommendations: List of recommended action strings from Bedrock.
-        deployment_events: List of deployment event dicts from Elasticsearch.
+        root_causes: List of probable root cause strings from Nova Pro.
+        explanation: Detailed explanation string from Nova Pro.
+        recommendations: List of recommended action strings from Nova Pro.
+        cloudtrail_summary: CloudTrail resource changes summary dict.
+        compute_optimizer_savings_usd: Estimated monthly savings from Compute Optimizer.
         dashboard_url: Optional URL to the cost dashboard for the alert link.
         analysis_id: Optional unique identifier for correlation/tracking.
-                     Generated automatically if not provided.
+        model_id: Bedrock model used for analysis (shown in footer).
+        deployment_events: Deprecated — ignored. Kept for backward compatibility.
 
     Returns:
         Slack API-compatible message dict (``blocks`` + ``text`` fallback).
@@ -132,7 +168,7 @@ def build_slack_message(
     timestamp_iso = _utcnow_iso()
 
     root_cause_text = "\n".join(f"• {cause}" for cause in root_causes) or "_No root causes identified._"
-    deployment_text = _format_deployment_events(deployment_events)
+    cloudtrail_text = _format_cloudtrail_findings(cloudtrail_summary)
     recommendations_text = _format_recommendations(recommendations)
 
     delta_sign = "+" if cost_delta >= 0 else ""
@@ -141,6 +177,12 @@ def build_slack_message(
     fallback_text = (
         f"AWS Cost Anomaly [{severity}]: {analysis_date} cost ${yesterday_cost:.2f} "
         f"({delta_sign}{percentage_increase:.1f}% vs ${baseline_cost:.2f} baseline)"
+    )
+
+    savings_text = (
+        f" | :money_with_wings: Est. monthly savings available: *${compute_optimizer_savings_usd:,.2f}*"
+        if compute_optimizer_savings_usd > 0
+        else ""
     )
 
     blocks: list[dict[str, Any]] = [
@@ -194,7 +236,7 @@ def build_slack_message(
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"*:mag: Root Cause Analysis*\n{explanation}",
+                "text": f"*:mag: Root Cause Analysis (Amazon Nova Pro)*\n{explanation}",
             },
         },
         {
@@ -209,7 +251,7 @@ def build_slack_message(
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"*:rocket: Recent Deployment Events (Last 24h)*\n{deployment_text}",
+                "text": f"*:cloud: CloudTrail Resource Changes (Last 24h)*\n{cloudtrail_text}",
             },
         },
         {"type": "divider"},
@@ -222,7 +264,20 @@ def build_slack_message(
         },
     ]
 
-    # Append dashboard button if URL is provided
+    if compute_optimizer_savings_usd > 0:
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"*:money_with_wings: Compute Optimizer Opportunities*\n"
+                        f"Estimated monthly savings: *${compute_optimizer_savings_usd:,.2f}*"
+                    ),
+                },
+            }
+        )
+
     if dashboard_url:
         blocks.append(
             {
@@ -250,8 +305,10 @@ def build_slack_message(
                 {
                     "type": "mrkdwn",
                     "text": (
-                        f":clock1: Alert generated at `{timestamp_iso}` UTC  |  "
-                        f"Analysis ID: `{analysis_id}`"
+                        f":clock1: `{timestamp_iso}` UTC  |  "
+                        f"Analysis ID: `{analysis_id}`  |  "
+                        f"Model: `{model_id}`"
+                        f"{savings_text}"
                     ),
                 }
             ],
@@ -341,11 +398,15 @@ def send_anomaly_alert(
     root_causes: list[str],
     explanation: str,
     recommendations: list[str],
-    deployment_events: list[dict[str, Any]],
+    cloudtrail_summary: Optional[dict[str, Any]] = None,
+    compute_optimizer_savings_usd: float = 0.0,
     dashboard_url: str = "",
     analysis_id: Optional[str] = None,
+    model_id: str = "amazon.nova-pro-v1:0",
+    # Legacy parameter kept for backward compatibility
+    deployment_events: Optional[list[dict[str, Any]]] = None,
 ) -> bool:
-    """Build and send an anomaly alert to Slack in one call.
+    """Build and send a cost anomaly alert to Slack in one call.
 
     Convenience wrapper that combines :func:`build_slack_message` and
     :func:`post_to_slack`.
@@ -359,11 +420,14 @@ def send_anomaly_alert(
         percentage_increase: Percentage increase vs baseline.
         severity: Severity — HIGH, MEDIUM, or LOW.
         root_causes: List of probable root cause strings.
-        explanation: Detailed Bedrock explanation.
+        explanation: Detailed Nova Pro explanation.
         recommendations: List of recommended actions.
-        deployment_events: Recent deployment events from Elasticsearch.
+        cloudtrail_summary: CloudTrail resource changes summary dict.
+        compute_optimizer_savings_usd: Estimated monthly savings from Compute Optimizer.
         dashboard_url: Optional URL to cost dashboard.
         analysis_id: Optional tracking identifier.
+        model_id: Bedrock model used for the analysis.
+        deployment_events: Deprecated — ignored. Kept for backward compatibility.
 
     Returns:
         ``True`` if the alert was sent successfully.
@@ -381,9 +445,11 @@ def send_anomaly_alert(
         root_causes=root_causes,
         explanation=explanation,
         recommendations=recommendations,
-        deployment_events=deployment_events,
+        cloudtrail_summary=cloudtrail_summary,
+        compute_optimizer_savings_usd=compute_optimizer_savings_usd,
         dashboard_url=dashboard_url,
         analysis_id=analysis_id,
+        model_id=model_id,
     )
 
     logger.info(
@@ -393,6 +459,7 @@ def send_anomaly_alert(
             "analysis_date": analysis_date,
             "analysis_id": analysis_id,
             "percentage_increase": percentage_increase,
+            "model_id": model_id,
         },
     )
 

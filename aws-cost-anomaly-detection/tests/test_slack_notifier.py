@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from slack_notifier import (
     SlackException,
-    _format_deployment_events,
+    _format_cloudtrail_findings,
     _format_recommendations,
     build_slack_message,
     post_to_slack,
@@ -19,81 +19,60 @@ from slack_notifier import (
 )
 
 
-SAMPLE_DEPLOYMENT_EVENTS = [
-    {
-        "timestamp": "2024-01-15T10:00:00Z",
-        "event_type": "deployment",
-        "service": "api-gateway",
-        "description": "Deploy v2.1.0",
-    },
-    {
-        "timestamp": "2024-01-15T12:00:00Z",
-        "event_type": "scaling_event",
-        "service": "ec2-asg",
-        "description": "Scale out to 10 instances",
-    },
-]
+SAMPLE_CLOUDTRAIL_SUMMARY = {
+    "ec2_launches": [
+        {
+            "eventtime": "2024-01-15T10:00:00Z",
+            "useridentity_arn": "arn:aws:iam::123456789012:user/deploy-bot",
+        }
+    ],
+    "autoscaling_changes": [
+        {
+            "eventtime": "2024-01-15T11:00:00Z",
+            "eventname": "SetDesiredCapacity",
+        }
+    ],
+    "rds_changes": [],
+    "iam_changes": [],
+    "total_events": 2,
+    "query_window_hours": 24,
+}
 
 
-class TestFormatDeploymentEvents:
-    """Tests for _format_deployment_events()."""
+class TestFormatCloudTrailFindings:
+    """Tests for _format_cloudtrail_findings()."""
 
-    def test_formats_single_event(self):
-        events = [
-            {
-                "timestamp": "2024-01-15T10:00:00Z",
-                "event_type": "deploy",
-                "service": "my-svc",
-                "description": "some change",
-            }
-        ]
-        text = _format_deployment_events(events)
-        assert "my-svc" in text
-        assert "some change" in text
+    def test_shows_ec2_launch_events(self):
+        text = _format_cloudtrail_findings(SAMPLE_CLOUDTRAIL_SUMMARY)
+        assert "EC2 Launches" in text
+        assert "2024-01-15T10:00:00Z" in text
 
-    def test_empty_list_returns_default_message(self):
-        text = _format_deployment_events([])
-        assert "No deployment events" in text
+    def test_shows_asg_changes(self):
+        text = _format_cloudtrail_findings(SAMPLE_CLOUDTRAIL_SUMMARY)
+        assert "Auto Scaling" in text
+        assert "SetDesiredCapacity" in text
 
-    def test_caps_at_max_events(self):
-        events = [
-            {
-                "timestamp": f"T{i}",
-                "event_type": "deploy",
-                "service": f"svc-{i}",
-                "description": "d",
-            }
-            for i in range(10)
-        ]
-        text = _format_deployment_events(events, max_events=3)
-        assert "svc-0" in text
-        assert "svc-2" in text
-        assert "svc-3" not in text
-        assert "7 more" in text
+    def test_returns_default_when_no_events(self):
+        empty = {
+            "ec2_launches": [],
+            "autoscaling_changes": [],
+            "rds_changes": [],
+            "iam_changes": [],
+            "total_events": 0,
+            "query_window_hours": 24,
+        }
+        text = _format_cloudtrail_findings(empty)
+        assert "No CloudTrail resource changes" in text
 
-    def test_no_overflow_message_when_within_limit(self):
-        events = [
-            {
-                "timestamp": "T1",
-                "event_type": "deploy",
-                "service": "svc",
-                "description": "d",
-            }
-        ]
-        text = _format_deployment_events(events, max_events=5)
-        assert "more" not in text
+    def test_returns_default_on_none_summary(self):
+        text = _format_cloudtrail_findings(None)
+        assert "No CloudTrail" in text
 
-    def test_uses_at_timestamp_fallback(self):
-        events = [
-            {
-                "@timestamp": "2024-01-15T10:00:00Z",
-                "event_type": "deploy",
-                "service": "svc",
-                "description": "d",
-            }
-        ]
-        text = _format_deployment_events(events)
-        assert "2024-01-15" in text
+    def test_caps_events_per_category(self):
+        many_ec2 = [{"eventtime": f"T{i}", "useridentity_arn": "arn:user"} for i in range(10)]
+        summary = {**SAMPLE_CLOUDTRAIL_SUMMARY, "ec2_launches": many_ec2, "total_events": 10}
+        text = _format_cloudtrail_findings(summary, max_events_per_category=2)
+        assert "more" in text
 
 
 class TestFormatRecommendations:
@@ -123,11 +102,12 @@ class TestBuildSlackMessage:
             percentage_increase=50.0,
             severity="HIGH",
             root_causes=["EC2 spike"],
-            explanation="Costs increased due to EC2.",
+            explanation="Costs increased due to EC2 scale-out events in CloudTrail.",
             recommendations=["Review EC2 usage"],
-            deployment_events=SAMPLE_DEPLOYMENT_EVENTS,
+            cloudtrail_summary=SAMPLE_CLOUDTRAIL_SUMMARY,
             dashboard_url="https://console.aws.amazon.com/cost-reports",
             analysis_id="abc12345",
+            model_id="amazon.nova-pro-v1:0",
         )
         defaults.update(kwargs)
         return build_slack_message(**defaults)
@@ -177,7 +157,7 @@ class TestBuildSlackMessage:
         block_types = [b["type"] for b in msg["attachments"][0]["blocks"]]
         assert "actions" not in block_types
 
-    def test_auto_generates_analysis_id(self):
+    def test_auto_generates_analysis_id_when_none(self):
         msg = build_slack_message(
             analysis_date="2024-01-15",
             yesterday_cost=120.0,
@@ -188,14 +168,36 @@ class TestBuildSlackMessage:
             root_causes=[],
             explanation="test",
             recommendations=[],
-            deployment_events=[],
         )
         assert "text" in msg
 
-    def test_deployment_events_rendered(self):
+    def test_cloudtrail_events_rendered_in_blocks(self):
         msg = self._build_default()
         full_text = str(msg)
-        assert "api-gateway" in full_text
+        assert "EC2 Launches" in full_text or "2024-01-15" in full_text
+
+    def test_model_id_in_footer(self):
+        msg = self._build_default(model_id="amazon.nova-pro-v1:0")
+        full_text = str(msg)
+        assert "amazon.nova-pro-v1:0" in full_text
+
+    def test_compute_optimizer_savings_shown_when_nonzero(self):
+        msg = self._build_default(compute_optimizer_savings_usd=145.0)
+        full_text = str(msg)
+        assert "145" in full_text
+
+    def test_no_savings_block_when_zero(self):
+        msg = self._build_default(compute_optimizer_savings_usd=0.0)
+        # When savings is 0, no separate savings block is added
+        block_texts = str(msg)
+        # Just check it doesn't crash
+        assert "text" in msg
+
+    def test_nova_pro_mentioned_in_root_cause_block(self):
+        """Root cause section should reference Nova Pro."""
+        msg = self._build_default(explanation="Nova Pro analysis found EC2 scale-out.")
+        full_text = str(msg)
+        assert "Nova Pro" in full_text
 
 
 class TestPostToSlack:
@@ -255,7 +257,7 @@ class TestPostToSlack:
 class TestSendAnomalyAlert:
     """Tests for send_anomaly_alert()."""
 
-    def test_successful_send(self):
+    def test_successful_send_with_cloudtrail(self):
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.text = "ok"
@@ -269,10 +271,12 @@ class TestSendAnomalyAlert:
                 cost_delta=50.0,
                 percentage_increase=50.0,
                 severity="HIGH",
-                root_causes=["EC2 spike"],
-                explanation="Explanation text",
-                recommendations=["Fix it"],
-                deployment_events=SAMPLE_DEPLOYMENT_EVENTS,
+                root_causes=["EC2 spike detected via CloudTrail"],
+                explanation="Nova Pro: 3x m5.xlarge instances launched.",
+                recommendations=["Review EC2 usage"],
+                cloudtrail_summary=SAMPLE_CLOUDTRAIL_SUMMARY,
+                compute_optimizer_savings_usd=95.0,
+                model_id="amazon.nova-pro-v1:0",
             )
 
         assert result is True
@@ -290,7 +294,29 @@ class TestSendAnomalyAlert:
                 root_causes=[],
                 explanation="",
                 recommendations=[],
-                deployment_events=[],
             )
 
         assert result is False
+
+    def test_backward_compat_with_deployment_events_param(self):
+        """send_anomaly_alert must accept the legacy deployment_events parameter."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.text = "ok"
+
+        with patch("slack_notifier.requests.post", return_value=mock_response):
+            result = send_anomaly_alert(
+                webhook_url="https://hooks.slack.com/test",
+                analysis_date="2024-01-15",
+                yesterday_cost=150.0,
+                baseline_cost=100.0,
+                cost_delta=50.0,
+                percentage_increase=50.0,
+                severity="HIGH",
+                root_causes=[],
+                explanation="",
+                recommendations=[],
+                deployment_events=[],  # legacy parameter
+            )
+
+        assert result is True

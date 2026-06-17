@@ -24,13 +24,18 @@ output "eventbridge_rule_arn" {
 }
 
 output "dynamodb_table_name" {
-  description = "Name of the DynamoDB table used for idempotency tracking."
-  value       = aws_dynamodb_table.idempotency.name
+  description = "Name of the DynamoDB table for cost baselines, idempotency, and cache."
+  value       = aws_dynamodb_table.finops_baselines.name
 }
 
 output "dynamodb_table_arn" {
-  description = "ARN of the DynamoDB idempotency table."
-  value       = aws_dynamodb_table.idempotency.arn
+  description = "ARN of the DynamoDB FinOps baselines table."
+  value       = aws_dynamodb_table.finops_baselines.arn
+}
+
+output "athena_workgroup_name" {
+  description = "Name of the Athena workgroup for CloudTrail queries."
+  value       = aws_athena_workgroup.finops_cloudtrail.name
 }
 
 output "account_id" {

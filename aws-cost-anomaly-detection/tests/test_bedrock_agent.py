@@ -1,4 +1,4 @@
-"""Unit tests for bedrock_agent.py."""
+"""Unit tests for bedrock_agent.py — Amazon Nova Pro integration."""
 
 import json
 import sys
@@ -28,52 +28,63 @@ SAMPLE_COST_DATA = {
     "analysis_date": "2024-01-15",
 }
 
-SAMPLE_DEPLOYMENT_LOGS = [
-    {
-        "timestamp": "2024-01-15T10:00:00Z",
-        "event_type": "deployment",
-        "service": "api-gateway",
-        "description": "New API version deployed",
-    }
-]
+SAMPLE_CLOUDTRAIL_SUMMARY = """### CloudTrail Resource Changes (Last 24h) — 2 events
 
-VALID_BEDROCK_RESPONSE = {
+**EC2 Launches** (1 events):
+  - [2024-01-15T10:00:00Z] arn:aws:iam::123456789012:user/deploy-bot: ...
+
+**Auto Scaling Changes** (1 events):
+  - [2024-01-15T11:00:00Z] SetDesiredCapacity: ..."""
+
+VALID_NOVA_PRO_RESPONSE = {
     "anomaly_severity": "HIGH",
-    "probable_root_causes": ["New API deployment increased EC2 usage", "Data transfer spike"],
-    "explanation": "The 50% cost increase correlates with the API deployment.",
-    "recommendations": ["Review EC2 instance types", "Enable Cost Anomaly Detection alerts"],
+    "probable_root_causes": [
+        "3x m5.xlarge EC2 instances launched in production",
+        "Auto Scaling group scaled from 3 to 8 instances",
+    ],
+    "explanation": "The 50% cost increase correlates with CloudTrail scale-out events.",
+    "recommendations": [
+        "Review EC2 instance types for right-sizing.",
+        "Enable AWS Cost Anomaly Detection.",
+    ],
 }
+
+
+class TestDefaultModelId:
+    """Verify the default model is Amazon Nova Pro."""
+
+    def test_default_model_is_nova_pro(self):
+        assert DEFAULT_MODEL_ID == "amazon.nova-pro-v1:0"
 
 
 class TestBuildAnalysisPrompt:
     """Tests for _build_analysis_prompt()."""
 
     def test_includes_cost_data(self):
-        prompt = _build_analysis_prompt(SAMPLE_COST_DATA, [])
+        prompt = _build_analysis_prompt(SAMPLE_COST_DATA)
         assert "$150.00" in prompt
         assert "$100.00" in prompt
         assert "50.0%" in prompt
 
-    def test_includes_deployment_events(self):
-        prompt = _build_analysis_prompt(SAMPLE_COST_DATA, SAMPLE_DEPLOYMENT_LOGS)
-        assert "api-gateway" in prompt
-        assert "New API version deployed" in prompt
+    def test_includes_cloudtrail_summary(self):
+        prompt = _build_analysis_prompt(SAMPLE_COST_DATA, cloudtrail_summary=SAMPLE_CLOUDTRAIL_SUMMARY)
+        assert "CloudTrail" in prompt
+        assert "EC2 Launches" in prompt
 
-    def test_handles_empty_deployment_logs(self):
-        prompt = _build_analysis_prompt(SAMPLE_COST_DATA, [])
-        assert "No deployment events" in prompt
+    def test_handles_no_cloudtrail_summary(self):
+        prompt = _build_analysis_prompt(SAMPLE_COST_DATA)
+        assert "Analysis Request" in prompt
 
-    def test_caps_events_at_20(self):
-        many_events = [
-            {"timestamp": f"T{i}", "event_type": "deploy", "service": "svc", "description": "d"}
-            for i in range(30)
-        ]
-        prompt = _build_analysis_prompt(SAMPLE_COST_DATA, many_events)
-        # Only 20 events should be included; count occurrences of "svc:"
-        assert prompt.count("svc:") == 20
+    def test_includes_compute_optimizer_summary(self):
+        optimizer_text = "### Compute Optimizer Recommendations — 1 items"
+        prompt = _build_analysis_prompt(
+            SAMPLE_COST_DATA,
+            compute_optimizer_summary=optimizer_text,
+        )
+        assert "Compute Optimizer" in prompt
 
     def test_analysis_date_included(self):
-        prompt = _build_analysis_prompt(SAMPLE_COST_DATA, [])
+        prompt = _build_analysis_prompt(SAMPLE_COST_DATA)
         assert "2024-01-15" in prompt
 
 
@@ -81,13 +92,13 @@ class TestParseBedrockResponse:
     """Tests for _parse_bedrock_response()."""
 
     def test_parses_valid_json(self):
-        raw = json.dumps(VALID_BEDROCK_RESPONSE)
+        raw = json.dumps(VALID_NOVA_PRO_RESPONSE)
         result = _parse_bedrock_response(raw)
         assert result["anomaly_severity"] == "HIGH"
         assert len(result["probable_root_causes"]) == 2
 
     def test_strips_markdown_fences(self):
-        raw = f"```json\n{json.dumps(VALID_BEDROCK_RESPONSE)}\n```"
+        raw = f"```json\n{json.dumps(VALID_NOVA_PRO_RESPONSE)}\n```"
         result = _parse_bedrock_response(raw)
         assert result["anomaly_severity"] == "HIGH"
 
@@ -101,13 +112,13 @@ class TestParseBedrockResponse:
             _parse_bedrock_response(json.dumps(incomplete))
 
     def test_severity_normalised_to_uppercase(self):
-        data = dict(VALID_BEDROCK_RESPONSE)
+        data = dict(VALID_NOVA_PRO_RESPONSE)
         data["anomaly_severity"] = "high"
         result = _parse_bedrock_response(json.dumps(data))
         assert result["anomaly_severity"] == "HIGH"
 
     def test_invalid_severity_defaults_to_medium(self):
-        data = dict(VALID_BEDROCK_RESPONSE)
+        data = dict(VALID_NOVA_PRO_RESPONSE)
         data["anomaly_severity"] = "CRITICAL"
         result = _parse_bedrock_response(json.dumps(data))
         assert result["anomaly_severity"] == "MEDIUM"
@@ -118,7 +129,7 @@ class TestFallbackResponse:
 
     def test_high_severity_over_50_pct(self):
         cost_data = {"percentage_increase": 60.0}
-        result = _fallback_response(cost_data, "Bedrock unavailable")
+        result = _fallback_response(cost_data, "Nova Pro unavailable")
         assert result.anomaly_severity == "HIGH"
         assert result.is_fallback is True
 
@@ -140,16 +151,21 @@ class TestFallbackResponse:
         result = _fallback_response({"percentage_increase": 20.0}, "error")
         assert len(result.probable_root_causes) > 0
 
+    def test_mentions_cloudtrail_in_fallback(self):
+        result = _fallback_response({"percentage_increase": 20.0}, "error")
+        combined = " ".join(result.recommendations)
+        assert "CloudTrail" in combined or "Cost Explorer" in combined
+
 
 class TestInvokeBedrockAnalysis:
-    """Tests for invoke_bedrock_analysis()."""
+    """Tests for invoke_bedrock_analysis() with Amazon Nova Pro."""
 
     def _make_mock_client(self) -> MagicMock:
         mock_client = MagicMock()
         mock_client.converse.return_value = {
             "output": {
                 "message": {
-                    "content": [{"text": json.dumps(VALID_BEDROCK_RESPONSE)}]
+                    "content": [{"text": json.dumps(VALID_NOVA_PRO_RESPONSE)}]
                 }
             },
             "usage": {"inputTokens": 500, "outputTokens": 200},
@@ -161,7 +177,7 @@ class TestInvokeBedrockAnalysis:
             mock_builder.return_value = self._make_mock_client()
             result = invoke_bedrock_analysis(
                 cost_data=SAMPLE_COST_DATA,
-                deployment_logs=SAMPLE_DEPLOYMENT_LOGS,
+                cloudtrail_summary=SAMPLE_CLOUDTRAIL_SUMMARY,
             )
 
         assert isinstance(result, BedrockAnalysisResult)
@@ -169,6 +185,35 @@ class TestInvokeBedrockAnalysis:
         assert result.is_fallback is False
         assert result.input_tokens == 500
         assert result.output_tokens == 200
+
+    def test_default_region_is_ap_south_1(self):
+        with patch("bedrock_agent._build_bedrock_client") as mock_builder:
+            mock_builder.return_value = self._make_mock_client()
+            invoke_bedrock_analysis(cost_data=SAMPLE_COST_DATA)
+        mock_builder.assert_called_once_with("ap-south-1")
+
+    def test_uses_nova_pro_model_id_by_default(self):
+        with patch("bedrock_agent._build_bedrock_client") as mock_builder:
+            mock_client = self._make_mock_client()
+            mock_builder.return_value = mock_client
+            result = invoke_bedrock_analysis(cost_data=SAMPLE_COST_DATA)
+
+        call_kwargs = mock_client.converse.call_args[1]
+        assert call_kwargs["modelId"] == "amazon.nova-pro-v1:0"
+        assert result.model_id == "amazon.nova-pro-v1:0"
+
+    def test_passes_cloudtrail_in_prompt(self):
+        with patch("bedrock_agent._build_bedrock_client") as mock_builder:
+            mock_client = self._make_mock_client()
+            mock_builder.return_value = mock_client
+            invoke_bedrock_analysis(
+                cost_data=SAMPLE_COST_DATA,
+                cloudtrail_summary=SAMPLE_CLOUDTRAIL_SUMMARY,
+            )
+
+        call_kwargs = mock_client.converse.call_args[1]
+        prompt_text = call_kwargs["messages"][0]["content"][0]["text"]
+        assert "CloudTrail" in prompt_text
 
     def test_returns_fallback_on_client_error(self):
         from botocore.exceptions import ClientError
@@ -183,7 +228,6 @@ class TestInvokeBedrockAnalysis:
 
             result = invoke_bedrock_analysis(
                 cost_data=SAMPLE_COST_DATA,
-                deployment_logs=[],
                 max_attempts=1,
             )
 
@@ -200,10 +244,7 @@ class TestInvokeBedrockAnalysis:
             }
             mock_builder.return_value = mock_client
 
-            result = invoke_bedrock_analysis(
-                cost_data=SAMPLE_COST_DATA,
-                deployment_logs=[],
-            )
+            result = invoke_bedrock_analysis(cost_data=SAMPLE_COST_DATA)
 
         assert result.is_fallback is True
 
@@ -212,7 +253,7 @@ class TestInvokeBedrockAnalysis:
 
         valid_response = {
             "output": {
-                "message": {"content": [{"text": json.dumps(VALID_BEDROCK_RESPONSE)}]}
+                "message": {"content": [{"text": json.dumps(VALID_NOVA_PRO_RESPONSE)}]}
             },
             "usage": {"inputTokens": 100, "outputTokens": 50},
         }
@@ -228,7 +269,6 @@ class TestInvokeBedrockAnalysis:
             with patch("bedrock_agent.time.sleep"):
                 result = invoke_bedrock_analysis(
                     cost_data=SAMPLE_COST_DATA,
-                    deployment_logs=[],
                     max_attempts=3,
                     base_delay=0.01,
                 )
@@ -237,12 +277,11 @@ class TestInvokeBedrockAnalysis:
         assert mock_client.converse.call_count == 2
 
     def test_uses_configured_model_id(self):
-        custom_model = "anthropic.claude-3-haiku-20240307-v1:0"
+        custom_model = "amazon.nova-lite-v1:0"
         with patch("bedrock_agent._build_bedrock_client") as mock_builder:
             mock_builder.return_value = self._make_mock_client()
             result = invoke_bedrock_analysis(
                 cost_data=SAMPLE_COST_DATA,
-                deployment_logs=[],
                 model_id=custom_model,
             )
 
@@ -251,10 +290,21 @@ class TestInvokeBedrockAnalysis:
     def test_token_usage_tracked(self):
         with patch("bedrock_agent._build_bedrock_client") as mock_builder:
             mock_builder.return_value = self._make_mock_client()
-            result = invoke_bedrock_analysis(
-                cost_data=SAMPLE_COST_DATA,
-                deployment_logs=[],
-            )
+            result = invoke_bedrock_analysis(cost_data=SAMPLE_COST_DATA)
 
         assert result.input_tokens > 0
         assert result.output_tokens > 0
+
+    def test_inference_config_uses_correct_temperature(self):
+        with patch("bedrock_agent._build_bedrock_client") as mock_builder:
+            mock_client = self._make_mock_client()
+            mock_builder.return_value = mock_client
+            invoke_bedrock_analysis(
+                cost_data=SAMPLE_COST_DATA,
+                temperature=0.7,
+                max_tokens=1024,
+            )
+
+        call_kwargs = mock_client.converse.call_args[1]
+        assert call_kwargs["inferenceConfig"]["temperature"] == 0.7
+        assert call_kwargs["inferenceConfig"]["maxTokens"] == 1024

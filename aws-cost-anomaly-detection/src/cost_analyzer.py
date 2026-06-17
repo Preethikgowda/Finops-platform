@@ -1,7 +1,7 @@
 """AWS Cost Anomaly Detection Engine.
 
 Fetches yesterday's AWS costs via Cost Explorer API, retrieves 7-day historical
-cost data from Elasticsearch, calculates rolling averages, and detects anomalies
+cost data from DynamoDB, calculates rolling averages, and detects anomalies
 when costs exceed the configurable threshold.
 """
 
@@ -58,8 +58,7 @@ def _retry_with_backoff(func: Any, max_attempts: int = 3, base_delay: float = 1.
     """Execute a callable with exponential backoff retry logic.
 
     Args:
-        func: Callable to execute. Must be a zero-argument callable (use
-              ``functools.partial`` or a lambda to bind arguments).
+        func: Callable to execute. Must be a zero-argument callable.
         max_attempts: Maximum number of attempts before raising.
         base_delay: Initial delay in seconds; doubles on each retry.
 
@@ -93,7 +92,7 @@ def _retry_with_backoff(func: Any, max_attempts: int = 3, base_delay: float = 1.
 
 
 def fetch_yesterday_cost(
-    region: str = "us-east-1",
+    region: str = "ap-south-1",
     granularity: str = "DAILY",
     metrics: Optional[list[str]] = None,
 ) -> float:
@@ -184,7 +183,7 @@ def calculate_rolling_average(historical_costs: list[float]) -> float:
     if not historical_costs:
         raise CostDataError(
             "Cannot calculate rolling average: no historical cost data provided. "
-            "Ensure at least one day of historical data is available in Elasticsearch."
+            "Ensure at least one day of historical data is available in DynamoDB."
         )
     avg = sum(historical_costs) / len(historical_costs)
     logger.debug(
@@ -237,9 +236,55 @@ def detect_anomaly(
     return anomaly_detected, cost_delta, percentage_increase
 
 
+def get_correlated_changes(
+    cloudtrail_database: str,
+    cloudtrail_table: str,
+    results_bucket: str,
+    region: str,
+    hours: int = 24,
+) -> dict[str, Any]:
+    """Fetch correlated resource changes from CloudTrail via Athena.
+
+    Returns a structured summary of EC2, Auto Scaling, RDS, and IAM changes
+    detected in CloudTrail that may explain the detected cost anomaly.
+
+    Args:
+        cloudtrail_database: Athena database name for CloudTrail logs.
+        cloudtrail_table: Athena table name for CloudTrail logs.
+        results_bucket: S3 bucket for Athena query results.
+        region: AWS region for the Athena client.
+        hours: Look-back window in hours.
+
+    Returns:
+        CloudTrail resource changes summary dict. Returns an empty summary
+        on failure so the pipeline continues without CloudTrail data.
+    """
+    try:
+        from cloudtrail_client import get_resource_changes_summary
+        return get_resource_changes_summary(
+            region=region,
+            cloudtrail_database=cloudtrail_database,
+            cloudtrail_table=cloudtrail_table,
+            results_bucket=results_bucket,
+            hours=hours,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not fetch CloudTrail changes (continuing without): %s", exc
+        )
+        return {
+            "ec2_launches": [],
+            "autoscaling_changes": [],
+            "rds_changes": [],
+            "iam_changes": [],
+            "total_events": 0,
+            "query_window_hours": hours,
+        }
+
+
 def run_cost_analysis(
     historical_costs: list[float],
-    region: str = "us-east-1",
+    region: str = "ap-south-1",
     threshold_pct: float = 15.0,
 ) -> CostAnalysisResult:
     """Orchestrate full cost anomaly analysis.
@@ -250,7 +295,7 @@ def run_cost_analysis(
 
     Args:
         historical_costs: List of daily costs (USD) for the rolling window
-                          (typically the last 7 days).
+                          (typically the last 7 days from DynamoDB).
         region: AWS region used by Cost Explorer.
         threshold_pct: Percentage increase above baseline that triggers anomaly.
 
